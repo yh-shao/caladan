@@ -9,6 +9,6 @@ CONFIG_OPTIMIZE=y
 # Build with clang instead of gcc
 CONFIG_CLANG=n
 # Build with split TX pool
-CONFIG_SPLIT_TX=n
+CONFIG_SPLIT_TX=y
 # Don't compile with UINTR instructions (useful for out-of-date compilers)
 CONFIG_NO_UINTR=n
