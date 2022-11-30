@@ -8,6 +8,8 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 
+#include <base/compiler.h>
+
 extern const char base_syscall_start[];
 extern const char base_syscall_end[];
 
@@ -45,3 +47,4 @@ static inline ssize_t syscall_write(int fd, const void *buf, size_t count)
 
 	return syscall_writev(fd, &iov, 1);
 }
+extern void syscall_exit(int status) __noreturn;

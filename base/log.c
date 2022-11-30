@@ -66,7 +66,7 @@ void logk_bug(bool fatal, const char *expr,
 {
 	logk(LOG_EMERG, "%s: %s:%d ASSERTION '%s' FAILED IN '%s'",
 	     fatal ? "FATAL" : "WARN", file, line, expr, func);
-	logk_backtrace();
+	// logk_backtrace();
 
 	if (fatal)
 		init_shutdown(EXIT_FAILURE);
