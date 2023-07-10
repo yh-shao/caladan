@@ -36,7 +36,7 @@ struct thread {
 	size_t			waitq_micros;
 	uint64_t	tlsvar;
 	uint64_t	fsbase;
-	unsigned long		junction_tstate_buf[8];
+	unsigned long		junction_tstate_buf[24];
 };
 
 extern uint64_t thread_get_total_cycles(thread_t *th);

@@ -184,6 +184,7 @@ int preempt_init(void)
 	int ret;
 	struct cpuid_info regs;
 #endif
+
 	act.sa_flags = SA_SIGINFO | SA_NODEFER;
 
 	if (sigemptyset(&act.sa_mask) != 0) {

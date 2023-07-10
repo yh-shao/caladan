@@ -3,6 +3,7 @@
  */
 
 #include <sched.h>
+#include <signal.h>
 #include <immintrin.h>
 
 #include <base/stddef.h>
@@ -24,7 +25,7 @@ DEFINE_PERTHREAD(thread_t *, __self);
 DEFINE_PERTHREAD_ALIAS(thread_t * const, __self, __const_self);
 
 /* a pointer to the top of the per-kthread (TLS) runtime stack */
-static DEFINE_PERTHREAD(void *, runtime_stack);
+DEFINE_PERTHREAD(void *, runtime_stack);
 DEFINE_PERTHREAD(uint64_t, runtime_fsbase);
 /* Flag to prevent watchdog from running */
 bool disable_watchdog;
@@ -730,7 +731,26 @@ uint64_t thread_get_total_cycles(thread_t *th) {
 	return cycles;
 }
 
-static void thread_finish_cede(void)
+void thread_finish_yield(void)
+{
+	thread_t *curth = thread_self();
+	struct kthread *k = myk();
+
+	assert_preempt_disabled();
+
+	spin_lock(&k->lock);
+
+	/* check for softirqs */
+	softirq_run_locked(k);
+
+	curth->thread_ready = false;
+	curth->last_cpu = k->curr_cpu;
+	thread_ready_locked(curth);
+
+	schedule();
+}
+
+void thread_finish_cede(void)
 {
 	struct kthread *k = myk();
 	thread_t *myth = thread_self();
@@ -998,6 +1018,7 @@ static void runtime_top_of_stack(void)
  */
 int sched_init_thread(void)
 {
+	stack_t ss;
 	struct stack *s;
 
 	tcache_init_perthread(thread_tcache, perthread_ptr(thread_pt));
@@ -1008,6 +1029,12 @@ int sched_init_thread(void)
 
 	perthread_store(runtime_stack, (void *)stack_init_to_rsp(s, runtime_top_of_stack));
 	perthread_store(runtime_fsbase, _readfsbase_u64());
+
+	ss.ss_sp = &s->usable[0];
+	ss.ss_size = RUNTIME_STACK_SIZE;
+	ss.ss_flags = 0;
+	if (sigaltstack(&ss, NULL) == -1)
+		return -errno;
 
 	return 0;
 }

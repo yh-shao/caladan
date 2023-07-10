@@ -72,6 +72,7 @@ struct stack {
 };
 
 DECLARE_PERTHREAD(struct tcache_perthread, stack_pt);
+DECLARE_PERTHREAD(void *, runtime_stack);
 
 /**
  * stack_alloc - allocates a stack
