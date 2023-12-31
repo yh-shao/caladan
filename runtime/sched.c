@@ -861,6 +861,7 @@ static __always_inline thread_t *__thread_create(void)
 	// Can be used to detect newly created thread.
 	th->ready_tsc = 0;
 	th->total_cycles = 0;
+	th->xsave_area_in_use = false;
 	atomic8_write(&th->interrupt_state, 0);
 
 	return th;
@@ -1040,7 +1041,7 @@ int sched_init_thread(void)
 	if (!s)
 		return -ENOMEM;
 
-	perthread_store(runtime_stack, (void *)stack_init_to_rsp(s, runtime_top_of_stack));
+	perthread_store(runtime_stack, (void *)runtime_stack_init_to_rsp(s, runtime_top_of_stack));
 	perthread_store(runtime_fsbase, _readfsbase_u64());
 
 	ss.ss_sp = &s->usable[0];
