@@ -1,7 +1,7 @@
 # build configuration options (set to y for "yes", n for "no")
 
 # Enable SPDK NVMe support
-CONFIG_SPDK=n
+CONFIG_SPDK=y
 # Enable debug build mode (slower but enables several runtime checks)
 CONFIG_DEBUG=n
 # Enable additional compiler optimizations (may reduce compatibility)

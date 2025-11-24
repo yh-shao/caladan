@@ -68,6 +68,7 @@ endif
 endif
 ifeq ($(CONFIG_SPDK),y)
 FLAGS += -DDIRECT_STORAGE
+RUNTIME_LIBS += -L$(ROOT_PATH)/spdk/build/lib    # 强制本地 SPDK 库路径排在 pkg-config 生成的任何路径之前（要不然可能会优先链接系统路径中的 SPDK（例如 /usr/local/lib/libspdk_nvme.a），而不是经过修改的本项目下的 SPDK）
 RUNTIME_LIBS += $(shell PKG_CONFIG_PATH="$(PKG_CONFIG_PATH)" pkg-config --libs --static libdpdk)
 RUNTIME_LIBS += $(shell PKG_CONFIG_PATH="$(PKG_CONFIG_PATH)" pkg-config --libs --static spdk_nvme)
 RUNTIME_LIBS += $(shell PKG_CONFIG_PATH="$(PKG_CONFIG_PATH)" pkg-config --libs --static spdk_env_dpdk)
