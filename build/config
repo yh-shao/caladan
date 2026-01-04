@@ -3,9 +3,9 @@
 # Enable SPDK NVMe support
 CONFIG_SPDK=y
 # Enable debug build mode (slower but enables several runtime checks)
-CONFIG_DEBUG=n
+CONFIG_DEBUG=y
 # Enable additional compiler optimizations (may reduce compatibility)
-CONFIG_OPTIMIZE=y
+CONFIG_OPTIMIZE=n
 # Build with clang instead of gcc
 CONFIG_CLANG=n
 # Build with split TX pool

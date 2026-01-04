@@ -53,6 +53,7 @@ int kthread_init_thread(void)
 	mbufq_init(&mykthread->txpktq_overflow);
 	mbufq_init(&mykthread->txcmdq_overflow);
 	spin_lock_init(&mykthread->timer_lock);
+	// list_head_init(&mykthread->pending_dsa_jobs);   // 初始化 DSA 任务链表
 
 	mykthread->tid = thread_gettid();
 
@@ -61,6 +62,9 @@ int kthread_init_thread(void)
 
 	iok.threads[kthread_idx(mykthread)].tid = ret;
 
+	log_info("Runtime Logical Core %d is running on Linux Physical CPU %d",  mykthread->curr_cpu, sched_getcpu());
+
+	// log_info("kthread %u [tid: %d] | initialized pending_dsa_jobs list at %p", perthread_read(thread_id), mykthread->tid, &mykthread->pending_dsa_jobs);
 	return 0;
 }
 
@@ -73,6 +77,7 @@ static __always_inline void kthread_yield_to_iokernel(void)
 	uint64_t last_core = k->curr_cpu;
 	ssize_t s;
 
+	log_info("kthread %u [tid: %d] | parking core %d", this_thread_id(), k->tid, last_core);
 	/* yield to the iokernel */
 	do {
 		clear_preempt_needed();
@@ -83,6 +88,7 @@ static __always_inline void kthread_yield_to_iokernel(void)
 	if (k->curr_cpu != last_core)
 		STAT(CORE_MIGRATIONS)++;
 	store_release(&cpu_map[s].recent_kthread, k);
+	log_info("kthread %u [tid: %d] | get core %d", this_thread_id(), k->tid, k->curr_cpu);
 }
 
 

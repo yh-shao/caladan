@@ -24,6 +24,13 @@
 #include <runtime/rcu.h>
 #include <runtime/preempt.h>
 
+#include <dml/dml.h>
+struct dsa_req 
+{
+    thread_t*           waiting_th;    // 发起拷贝的 uthread
+    struct list_node    link;          // 用于挂入 kthread 的链表
+	dml_job_t           job;           // DML 任务描述符（需要放到最后）
+};
 
 /*
  * constant limits
@@ -371,6 +378,8 @@ struct kthread {
 
 	/* 10th cache-line, statistics counters */
 	uint64_t		stats[STAT_NR];
+
+	// struct list_head    pending_dsa_jobs;
 } __aligned(CACHE_LINE_SIZE * 2);
 
 /* compile-time verification of cache-line alignment */
@@ -435,6 +444,17 @@ static __always_inline __nofp void putk(void)
 /* preempt_cede_needed - check if kthread should cede */
 static __always_inline __nofp bool preempt_cede_needed(struct kthread *k)
 {
+	if (k == NULL)
+	{
+		log_info("preempt_cede_needed: k is NULL !!!!!!!!!!!!!");
+		return false;
+	}
+	if (k->q_ptrs == NULL)
+	{
+		log_info("preempt_cede_needed: k->q_ptrs is NULL !!!!!!!!!!!!!");
+		return false;
+	}
+
 	return k->q_ptrs->curr_grant_gen ==
 	       ACCESS_ONCE(k->q_ptrs->cede_gen);
 }

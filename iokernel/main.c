@@ -16,6 +16,7 @@
 
 #include "defs.h"
 #include "sched.h"
+#include "ksched.h"
 
 #define LOG_INTERVAL_US		(1000 * 1000)
 struct iokernel_cfg cfg;
@@ -117,6 +118,66 @@ static void dataplane_loop_vfio(void)
 	}
 }
 
+static inline void safe_senduipi(uint64_t index) {  // <--- 修改参数类型为 uint64_t
+    uint8_t failed;
+    asm volatile (
+        "senduipi %1; setz %0"
+        : "=r"(failed)
+        : "r"(index) 
+        : "cc", "memory"
+    );
+    
+    if (failed) {
+        log_warn("UIPI send failed for index %lu (ZF=1). Sender table invalid?", index);
+    }
+}
+
+static void check_spdk_and_preempt(void)
+{
+    struct proc *p;
+    struct thread *th;
+    int i, j;
+    uint32_t cons_idx;
+	bool work_done = false;
+
+    for (i = 0; i < dp.nr_clients; i++)   // 遍历所有 Runtime（进程）
+	{
+        p = dp.clients[i];
+        if (!p->has_storage) continue;
+		if (unlikely(!p->runtime_info)) continue;
+		if (atomic64_read(&p->runtime_info->spdk_uipi) == 0) continue;
+
+
+        for (j = 0; j < p->active_thread_count; j++)   // 遍历该进程的所有活跃 kthread
+		{
+            th = p->active_threads[j];
+            cons_idx = ACCESS_ONCE(*th->storage_hwq.consumer_idx);  // 读取 Runtime 更新的 Consumer Index
+
+            if (hwq_busy(&th->storage_hwq, cons_idx))   // 检查硬件队列是否有新完成
+			{
+                if (cons_idx != th->last_storage_cons_idx || !th->storage_was_busy)   // 如果 consumer index 变了：说明硬件写入了新的完成 entry 或者 Runtime 处理了一部分但还有剩余；如果之前不忙，现在忙了：说明是从空闲状态变成了有 IO 状态（上升沿）。
+				{
+					// log_info("[DEBUG] ready to send UIPI to core %d for SPDK IO", th->core);
+                    // ksched_enqueue_intr(th->core, KSCHED_INTR_YIELD);
+					sched_yield_on_core(th->core);
+					// __builtin_ia32_senduipi(th->core);
+					// safe_senduipi(th->core);
+                    th->last_storage_cons_idx = cons_idx;  // 更新状态，防止对同一批 IO 重复发送
+					work_done = true;
+                }
+                th->storage_was_busy = true;
+            } 
+			else 
+			{
+                th->storage_was_busy = false;
+                th->last_storage_cons_idx = cons_idx;   // 如果队列空了，同步一下 index，确保下次一来新 IO 就能触发
+            }
+        }
+    }
+
+	// if (work_done) ksched_send_intrs();
+}
+
 /*
  * The main dataplane thread.
  */
@@ -146,6 +207,7 @@ void dataplane_loop(void)
 
 		/* handle a burst of ingress packets */
 		work_done |= rx_burst();
+		check_spdk_and_preempt();
 
 		work_done |= dma_dequeue();
 

@@ -367,6 +367,7 @@ static struct uintr_ctx *alloc_uintr_ctx(bool admin)
 
 		if (admin) {
 			uitt->user_vec = SIGUSR1 - 1;
+			// uitt->user_vec = SIGURG - 1;
 
 			/* mark as valid only if this is an admin context */
 			uitt->valid = BIT(UINTR_UITT_VALID_BIT);

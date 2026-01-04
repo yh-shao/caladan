@@ -8,6 +8,7 @@
 
 #include "defs.h"
 #include "net/defs.h"
+#include <dml/dml.h>
 
 static bool softirq_iokernel_pending(struct kthread *k)
 {
@@ -26,6 +27,29 @@ bool softirq_pending(struct kthread *k, uint64_t now_tsc)
 {
 	return softirq_iokernel_pending(k) || softirq_timer_pending(k, now_tsc) ||
 	       storage_available_completions(k);
+}
+
+struct list_head pending_dsa_jobs[100];
+int dsa_ready = 0;
+static bool dsa_process_completions(struct kthread *k)   // 检查 DSA 是否完成
+{
+	bool found = false;
+    struct dsa_req *req, *next;
+    
+    // 遍历链表检查
+	list_for_each_safe(&pending_dsa_jobs[this_thread_id()], req, next, link)
+	{
+        dml_status_t status = dml_check_job(&req->job);  // 非阻塞检查硬件状态
+        // if (status == DML_STATUS_BEING_PROCESSED) continue; // 还没做完
+		if (status != DML_STATUS_OK) continue; // 还没成功
+        
+        // 做完了
+        list_del(&req->link);                 // 从公告板撕下来
+        thread_ready_head_locked(req->waiting_th); // 唤醒线程
+		found = true;
+		log_info("DSA job completed for kthread %u, add uthread %p to runqueue", this_thread_id(), req->waiting_th);
+    }
+	return found;
 }
 
 /**
@@ -65,8 +89,14 @@ bool softirq_run_locked(struct kthread *k)
 	if (!k->storage_busy && storage_available_completions(k)) {
 		k->storage_busy = true;
 		thread_ready_head_locked(k->storage_softirq);
+		log_info("SPDK IO finished, add storage_softirq uthread to the rq of kthread %u", this_thread_id());
 		work_done = true;
 	}
+
+	if (dsa_ready && !list_empty(&pending_dsa_jobs[this_thread_id()])) {
+        work_done = dsa_process_completions(k);
+		log_info("DSA completions processed for kthread %u", this_thread_id());
+    }
 
 	k->last_softirq_tsc = now_tsc;
 	return work_done;

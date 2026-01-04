@@ -18,7 +18,7 @@
  * struct control_hdr, please increment the version number!
  */
 
-#define CONTROL_HDR_VERSION 13
+#define CONTROL_HDR_VERSION 14  // 我增加了 1，因为在 runtime_info 里加了 spdk_uipi 字段
 
 /* The abstract namespace path for the control socket. */
 #define CONTROL_SOCK_PATH	"/run/iokernel.sock"
@@ -57,6 +57,7 @@ struct runtime_info {
 	struct congestion_info congestion;
 	uint64_t directpath_strides_posted;
 	atomic64_t directpath_strides_consumed;
+	atomic64_t spdk_uipi;  // 是否让 IOKernel 检查 SPDK 完成情况
 };
 
 enum {

@@ -79,6 +79,9 @@ RUNTIME_LIBS += $(MLX5_LIBS)
 INC += $(MLX5_INC)
 FLAGS += -DDIRECTPATH
 
+INC += -I/usr/local/include
+RUNTIME_LIBS += /usr/local/lib/libdml.a -luuid -lstdc++
+
 ifeq ($(CONFIG_SPLIT_TX),y)
 FLAGS += -DSPLIT_TX
 endif

@@ -52,6 +52,23 @@ static void seq_complete(void *arg, const struct spdk_nvme_cpl *completion)
 	thread_ready(th);
 }
 
+static bool probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid, struct spdk_nvme_ctrlr_opts *opts)
+{
+    log_info("Probing device: %s ... ", trid->traddr);
+
+    const char *target_addr = "0000:5a:00.0";           // 只绑定这个盘（因为目前我只用到一个盘）
+    if (strcasecmp(trid->traddr, target_addr) == 0)
+    {
+        log_info("Matched target address %s. Attaching...\n", target_addr);
+        return true;
+    }
+    else
+    {
+        log_info("Skipping non-target address %s.\n", trid->traddr);
+        return false;   // 不匹配则跳过
+    }
+}
+
 /**
  * attach_cb - callback run after nvme device has been attached
  *
@@ -64,19 +81,26 @@ static void attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 	const struct spdk_nvme_ctrlr_data *ctrlr_data;
 
 	num_ns = spdk_nvme_ctrlr_get_num_ns(ctrlr);
-	if (num_ns > 1) {
-		perror("more than 1 storage devices");
-		exit(1);
-	}
+	// if (num_ns > 1) {                             // 有多个 namespace 又咋了，使用 1 个不就好了，干嘛要 exit 呢
+	// 	perror("more than 1 storage devices");
+	// 	exit(1);
+	// }
 	if (num_ns == 0) {
 		perror("no storage device");
 		exit(1);
 	}
 	controller = ctrlr;
 	ctrlr_data = spdk_nvme_ctrlr_get_data(ctrlr);
-	spdk_namespace = spdk_nvme_ctrlr_get_ns(ctrlr, 1);
+	// spdk_namespace = spdk_nvme_ctrlr_get_ns(ctrlr, 1);
+	int nsid = spdk_nvme_ctrlr_get_first_active_ns(ctrlr);  // 使用第一个 active 的 namespace
+	spdk_namespace = spdk_nvme_ctrlr_get_ns(ctrlr, nsid);   
+	if (spdk_namespace == NULL) {
+        perror("Failed to get namespace structure");
+        exit(1);
+    }
 	block_size = spdk_nvme_ns_get_sector_size(spdk_namespace);
 	num_blocks = spdk_nvme_ns_get_num_sectors(spdk_namespace);
+	log_info("Attached to Namespace ID: %d on Controller: %s\n", nsid, trid->traddr);
 
 	for (i = 0; i < ARRAY_SIZE(known_devices); i++) {
 		if (!strncmp((char *)ctrlr_data->mn, known_devices[i].name,
@@ -86,8 +110,6 @@ static void attach_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid,
 			break;
 		}
 	}
-
-
 }
 
 /**
@@ -364,7 +386,7 @@ int storage_init(void)
 		return 1;
 	}
 
-	rc = spdk_nvme_probe(NULL, NULL, NULL, attach_cb, NULL);
+	rc = spdk_nvme_probe(NULL, NULL, probe_cb, attach_cb, NULL);
 	if (rc != 0) {
 		log_err("spdk_nvme_probe() failed");
 		return 1;
@@ -393,7 +415,316 @@ int storage_init(void)
 	if (!storage_buf_tcache)
 		return -ENOMEM;
 
+	log_info("SPDK storage init successfully!");
 	return 0;
+}
+
+void read_a_block_from_disk_to_blockcache(void *buf, uint64_t lba)
+{
+	if (!cfg_storage_enabled) return;
+
+	if (buf == NULL) 
+	{
+		log_info("read_a_block_from_disk_to_blockcache(): buf is NULL");
+		return;
+	}
+
+	struct kthread   *k = getk();
+	struct storage_q *q = &k->storage_q;
+
+	spin_lock(&q->lock);
+	int rc = spdk_nvme_ns_cmd_read(spdk_namespace, q->spdk_qp_handle, buf, lba, 1, seq_complete, thread_self(), 0);
+	if (unlikely(rc != 0)) 
+	{
+		spin_unlock(&q->lock);
+		putk();
+		return;
+	}
+
+	q->outstanding_reqs++;
+	thread_park_and_unlock_np(&q->lock);
+}
+
+void readObj(void* obj, size_t siz, uint64_t lba_start, uint32_t lba_count)
+{
+	if (!cfg_storage_enabled) return;
+
+	if (obj == NULL) 
+	{
+		log_info("readObj: obj is NULL");
+		return;
+	}
+
+	thread_t *th = thread_self();
+	uint64_t before_readObj = thread_get_total_cycles(th) / cycles_per_us;
+	uint64_t before_readObj_tsc = rdtsc();
+	
+	size_t req_size = lba_count * block_size;
+	bool use_thread_cache = req_size <= REQUEST_BUF_SZ;
+
+	struct kthread *k = getk();
+	struct storage_q *q = &k->storage_q;
+	if (k == NULL || q == NULL || q->spdk_qp_handle == NULL) 
+	{
+		log_info("readObj: storage not initialized properly");
+		return;
+	}
+
+	void *spdk_payload;
+	if (likely(use_thread_cache)) spdk_payload = tcache_alloc(perthread_ptr(storage_buf_pt));
+	else spdk_payload = spdk_zmalloc(req_size, 0, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+	if (unlikely(spdk_payload == NULL)) {
+		putk();
+		return;
+	}
+
+	spin_lock(&q->lock);
+
+	int rc = spdk_nvme_ns_cmd_read(spdk_namespace, q->spdk_qp_handle, spdk_payload, lba_start, lba_count, seq_complete, thread_self(), 0);
+	if (unlikely(rc != 0)) {
+		spin_unlock(&q->lock);
+		goto done_np;
+	}
+
+	q->outstanding_reqs++;
+	// log_info("before park: current fsbase: 0x%lx, runtime fsbase: 0x%lx", _readfsbase_u64(), perthread_read(runtime_fsbase));
+	thread_park_and_unlock_np(&q->lock);
+	// log_info("after park: current fsbase: 0x%lx, runtime fsbase: 0x%lx", _readfsbase_u64(), perthread_read(runtime_fsbase));
+	memcpy(obj, spdk_payload, siz);
+	preempt_disable();
+
+done_np:
+	if (likely(use_thread_cache)) tcache_free(perthread_ptr(storage_buf_pt), spdk_payload);
+	else spdk_free(spdk_payload);
+	preempt_enable();
+
+	uint64_t after_readObj = thread_get_total_cycles(th) / cycles_per_us;
+	uint64_t after_readObj_tsc = rdtsc();
+	log_info("[readObj() %lu us, uthread %lu us]", (after_readObj_tsc - before_readObj_tsc) / cycles_per_us, (after_readObj - before_readObj) / cycles_per_us);
+}
+
+void writeObj(void* obj, size_t siz, uint64_t lba_start, uint32_t lba_count)
+{	
+	if (!cfg_storage_enabled) return;
+
+	// thread_t *th = thread_self();
+	// uint64_t before_writeObj = thread_get_total_cycles(th) / cycles_per_us;
+	// uint64_t before_writeObj_tsc = rdtsc();
+
+	size_t req_size = lba_count * block_size;
+	bool use_thread_cache = req_size <= REQUEST_BUF_SZ;
+
+	struct kthread *k = getk();
+	struct storage_q *q = &k->storage_q;
+
+	void *spdk_payload;
+	if (likely(use_thread_cache)) spdk_payload = tcache_alloc(perthread_ptr(storage_buf_pt));
+	else spdk_payload = spdk_zmalloc(req_size, 0, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+
+	if (unlikely(spdk_payload == NULL)) {
+		putk();
+		return;
+	}
+
+	if (obj) memcpy(spdk_payload, obj, siz);
+
+	spin_lock(&q->lock);
+	
+	int rc = spdk_nvme_ns_cmd_write(spdk_namespace, q->spdk_qp_handle, spdk_payload, lba_start, lba_count, seq_complete, thread_self(), 0);
+	if (unlikely(rc != 0)) {
+		spin_unlock(&q->lock);
+		goto done_np;
+	}
+
+	q->outstanding_reqs++;
+	thread_park_and_unlock_np(&q->lock);
+	preempt_disable();
+
+done_np:
+	if (likely(use_thread_cache)) tcache_free(perthread_ptr(storage_buf_pt), spdk_payload);
+	else spdk_free(spdk_payload);
+
+	preempt_enable();
+
+	// uint64_t after_writeObj = thread_get_total_cycles(th) / cycles_per_us;
+	// uint64_t after_writeObj_tsc = rdtsc();
+}
+
+struct syncio_ctx {
+    volatile bool done;
+    int status;
+};
+static void sync_read_cb(void* arg, const struct spdk_nvme_cpl* cpl)
+{
+    struct syncio_ctx* ctx = (struct syncio_ctx*)arg;
+
+    if (spdk_nvme_cpl_is_error(cpl)) 
+        ctx->status = -EIO;
+    else 
+        ctx->status = 0;
+    
+	barrier();
+    ctx->done = true;
+}
+
+int readObj_sync(void* dest, size_t siz, uint64_t lba, uint32_t lba_count)
+{
+    if (!cfg_storage_enabled) return -ENODEV;
+	
+	size_t req_size = lba_count * block_size;
+	bool use_thread_cache = req_size <= REQUEST_BUF_SZ;
+
+	struct kthread* k = getk();
+	struct storage_q* q = &k->storage_q;
+
+    void *spdk_payload;
+	if (likely(use_thread_cache)) 
+        spdk_payload = tcache_alloc(perthread_ptr(storage_buf_pt));
+	else  
+        spdk_payload = spdk_zmalloc(req_size, 0, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
+
+	if (unlikely(spdk_payload == NULL)) 
+    {
+		preempt_enable();
+		return -ENOMEM;
+	}
+
+    struct syncio_ctx ctx = { .done = false, .status = 0 };
+
+	spin_lock(&q->lock);
+	int rc = spdk_nvme_ns_cmd_read(spdk_namespace, q->spdk_qp_handle, spdk_payload, lba, lba_count, sync_read_cb, &ctx, 0);
+    if (unlikely(rc != 0)) 
+    {
+		spin_unlock(&q->lock);
+		rc = -EIO;
+		goto done_np;
+	}
+
+    while (!ctx.done) 
+    {
+        spdk_nvme_qpair_process_completions(q->spdk_qp_handle, 0);
+        cpu_relax();
+    }
+    
+    spin_unlock(&q->lock);
+    memcpy(dest, spdk_payload, siz);
+    rc = ctx.status;
+
+done_np:
+	if (likely(use_thread_cache))
+		tcache_free(perthread_ptr(storage_buf_pt), spdk_payload);
+	else
+		spdk_free(spdk_payload);
+
+	preempt_enable();
+	return rc;
+}
+
+typedef struct BlockEntry
+{
+    uint64_t    lba;
+    char*       data;
+    bool        valid;    // 是否从盘上读取了数据
+    bool        dirty;    // 是否需要写回磁盘
+    spinlock_t  mtx;
+} BlockEntry;
+struct block_sgl_ctx 
+{
+    void*        *blockentries;     // 若干个 BlockEntry 地址构成的数组
+    uint32_t     num_blocks;        // 一共多少个 block
+    uint32_t     block_size;        // = BLOCK_SIZE
+    uint32_t     cur_index;         // 当前走到第几个 block
+};
+struct vectorIO_ctx 
+{
+    struct block_sgl_ctx sgl;
+	thread_t *th;
+};
+
+void block_reset_sgl(void *arg, uint32_t offset)
+{
+    struct vectorIO_ctx *ctx = (struct vectorIO_ctx *)arg;
+    ctx->sgl.cur_index = offset / ctx->sgl.block_size;
+}
+int block_next_sge(void *arg, void **address, uint32_t *length)
+{
+    struct vectorIO_ctx *ctx = (struct vectorIO_ctx *)arg;
+    struct block_sgl_ctx *sgl = &ctx->sgl;
+
+    if (sgl->cur_index >= sgl->num_blocks) return -1;  // 没有更多 buffer 了
+
+    BlockEntry* blockentry = (BlockEntry*)sgl->blockentries[sgl->cur_index++];
+    *address = blockentry->data;
+    *length  = sgl->block_size;
+    return 0;
+}
+
+void vectorIO_complete(void *arg, const struct spdk_nvme_cpl *cpl)
+{
+    struct vectorIO_ctx *ctx = (struct vectorIO_ctx *)arg;
+	thread_ready(ctx->th);
+}
+
+int read_blocks_from_disk(uint64_t lba_start, uint32_t lba_count, void* blockentries[])
+{
+	// log_info("read_blocks_from_disk() START: gonna read %u blocks from LBA %lu to blockcache", lba_count, lba_start);
+
+	if (!cfg_storage_enabled) return -1;
+	if (unlikely(lba_count == 0)) return -1;
+
+	struct vectorIO_ctx ctx = {};
+	ctx.th = thread_self();
+	ctx.sgl.blockentries = blockentries;
+	ctx.sgl.num_blocks = lba_count;
+	ctx.sgl.block_size = block_size;
+	ctx.sgl.cur_index = 0;
+
+	struct kthread   *k = getk();
+    struct storage_q *q = &k->storage_q;
+	
+	spin_lock(&q->lock);
+	int rc = spdk_nvme_ns_cmd_readv(spdk_namespace, q->spdk_qp_handle, lba_start, lba_count, vectorIO_complete, &ctx, 0, block_reset_sgl, block_next_sge);
+	if (unlikely(rc != 0)) 
+	{
+        spin_unlock(&q->lock);
+        putk();
+        return -1;
+    }
+	q->outstanding_reqs++;
+	thread_park_and_unlock_np(&q->lock);
+
+	// log_info("read_blocks_from_disk() DONE: have read %u blocks from LBA %lu to blockcache", lba_count, lba_start);
+	return 0;
+}
+
+int write_blocks_to_disk(uint64_t lba_start, uint32_t lba_count, void* blockentries[])
+{
+    if (!cfg_storage_enabled) return -1;
+    if (unlikely(lba_count == 0)) return -1;
+
+    struct vectorIO_ctx ctx = {};
+    ctx.th = thread_self();
+    ctx.sgl.blockentries = blockentries;
+    ctx.sgl.num_blocks = lba_count;
+    ctx.sgl.block_size = block_size;
+    ctx.sgl.cur_index = 0;
+
+    struct kthread *k = getk();
+    struct storage_q *q = &k->storage_q;
+    spin_lock(&q->lock);
+
+    int rc = spdk_nvme_ns_cmd_writev(spdk_namespace, q->spdk_qp_handle, lba_start, lba_count, vectorIO_complete, &ctx, 0, block_reset_sgl, block_next_sge);
+    if (unlikely(rc != 0)) 
+    {
+        spin_unlock(&q->lock);
+        putk();
+        return -1;
+    }
+
+    q->outstanding_reqs++;
+    thread_park_and_unlock_np(&q->lock);
+
+    return 0;
 }
 
 #else

@@ -378,7 +378,10 @@ static __noinline void schedule(void)
 	             cycles_per_us * RUNTIME_WATCHDOG_US)) {
 		l->last_softirq_tsc = start_tsc;
 		if (do_watchdog(l))
+		{
+			log_info("kthread %u: watchdog softirq did work", kthread_idx(l));
 			goto done;
+		}
 	}
 
 	/* move overflow tasks into the runqueue */
@@ -558,6 +561,7 @@ static __always_inline void enter_schedule(thread_t *curth)
 void thread_park_and_unlock_np(spinlock_t *l)
 {
 	thread_t *curth = thread_self();
+	curth->fsbase = _readfsbase_u64();    // 旧 uthread 的 fsbase 也应该作为 context 的一部分，被保存呀？
 
 	assert_preempt_disabled();
 	assert_spin_lock_held(l);
@@ -572,6 +576,7 @@ void thread_park_and_unlock_np(spinlock_t *l)
 void thread_park_and_preempt_enable(void)
 {
 	thread_t *curth = thread_self();
+	curth->fsbase = _readfsbase_u64();    // 旧 uthread 的 fsbase 也应该作为 context 的一部分，被保存呀？
 
 	assert_preempt_disabled();
 	enter_schedule(curth);

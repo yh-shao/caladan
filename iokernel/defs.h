@@ -144,6 +144,9 @@ struct thread {
 	/* legacy directpath queues */
 	struct hwq		directpath_hwq;
 	struct hwq		storage_hwq;
+
+	uint32_t        last_storage_cons_idx;   // 记录上一次处理过的 Consumer Index (Shadow Tail)
+	bool            storage_was_busy;        // 记录上一轮检查时队列是否繁忙
 };
 
 BUILD_ASSERT(offsetof(struct thread, rxq.send_tail) <= CACHE_LINE_SIZE);
