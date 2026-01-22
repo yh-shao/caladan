@@ -207,12 +207,20 @@ void dataplane_loop(void)
 
 		/* handle a burst of ingress packets */
 		work_done |= rx_burst();
-		check_spdk_and_preempt();
+		// check_spdk_and_preempt();
 
 		work_done |= dma_dequeue();
 
 		/* adjust core assignments */
 		sched_poll();
+		static uint64_t last_refill_time = 0;
+		uint64_t now = microtime();
+		if (now - last_refill_time >= REFILL_TIME * TO_US)   // 设置每隔 REFILL_TIME 执行一次
+		{
+			refillQuota();
+			last_refill_time = now;
+		}
+
 
 		/* drain overflow completion queues */
 		work_done |= tx_drain_completions();

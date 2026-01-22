@@ -667,7 +667,7 @@ void vectorIO_complete(void *arg, const struct spdk_nvme_cpl *cpl)
 
 int read_blocks_from_disk(uint64_t lba_start, uint32_t lba_count, void* blockentries[])
 {
-	// log_info("read_blocks_from_disk() START: gonna read %u blocks from LBA %lu to blockcache", lba_count, lba_start);
+	log_info("read_blocks_from_disk() START: gonna read %u blocks from LBA %lu to blockcache", lba_count, lba_start);
 
 	if (!cfg_storage_enabled) return -1;
 	if (unlikely(lba_count == 0)) return -1;
@@ -683,14 +683,17 @@ int read_blocks_from_disk(uint64_t lba_start, uint32_t lba_count, void* blockent
     struct storage_q *q = &k->storage_q;
 	
 	spin_lock(&q->lock);
-	int rc = spdk_nvme_ns_cmd_readv(spdk_namespace, q->spdk_qp_handle, lba_start, lba_count, vectorIO_complete, &ctx, 0, block_reset_sgl, block_next_sge);
-	if (unlikely(rc != 0)) 
-	{
-        spin_unlock(&q->lock);
-        putk();
-        return -1;
-    }
-	q->outstanding_reqs++;
+	if (ifQuotaPermit(lba_count * block_size))
+	{	
+		int rc = spdk_nvme_ns_cmd_readv(spdk_namespace, q->spdk_qp_handle, lba_start, lba_count, vectorIO_complete, &ctx, 0, block_reset_sgl, block_next_sge);
+		if (unlikely(rc != 0)) 
+		{
+        	spin_unlock(&q->lock);
+        	putk();
+        	return -1;
+    	}
+		q->outstanding_reqs++;
+	}
 	thread_park_and_unlock_np(&q->lock);
 
 	// log_info("read_blocks_from_disk() DONE: have read %u blocks from LBA %lu to blockcache", lba_count, lba_start);

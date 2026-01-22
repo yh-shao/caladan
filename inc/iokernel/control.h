@@ -13,6 +13,8 @@
 #include <iokernel/shm.h>
 #include <net/ethernet.h>
 
+#include <iokernel/quota.h>
+
 /*
  * WARNING: If you make any changes that impact the layout of
  * struct control_hdr, please increment the version number!
@@ -58,6 +60,7 @@ struct runtime_info {
 	uint64_t directpath_strides_posted;
 	atomic64_t directpath_strides_consumed;
 	atomic64_t spdk_uipi;  // 是否让 IOKernel 检查 SPDK 完成情况
+	QuotaInfo Q;
 };
 
 enum {
@@ -142,6 +145,8 @@ struct iokernel_info {
 	bool			transparent_hugepages;
 	bool			no_tx_offloads;
 	uint8_t			min_pkt_size;
+
+	GlobalQuotaPool global_pool;	
 };
 
 BUILD_ASSERT(sizeof(struct iokernel_info) <= IOKERNEL_INFO_SIZE);

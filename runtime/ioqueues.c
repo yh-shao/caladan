@@ -187,8 +187,8 @@ int ioqueues_init_early(void)
 	struct sockaddr_un addr;
 	void *shbuf;
 
-	shbuf = mem_map_shm_rdonly(IOKERNEL_INFO_KEY, NULL, IOKERNEL_INFO_SIZE,
-	                           PGSIZE_4KB);
+	shbuf = mem_map_shm(IOKERNEL_INFO_KEY, NULL, IOKERNEL_INFO_SIZE,
+	                           PGSIZE_4KB, false);                     // 从而让 runtime 可以修改 iok.iok_info 中的 GlobalQuotaPool
 	if (unlikely(shbuf == MAP_FAILED)) {
 		log_err("control_setup: failed to map iokernel info region");
 		log_err("Please make sure IOKernel is running");

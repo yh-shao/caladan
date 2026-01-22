@@ -31,6 +31,7 @@
 #include "hw_timestamp.h"
 #include "defs.h"
 #include "sched.h"
+#include <iokernel/quota.h>
 
 #define EPOLL_CONTROLFD_COOKIE 0
 #define EPOLL_EFD_COOKIE 1
@@ -639,6 +640,8 @@ int control_init(void)
 
 	if (nic_pci_addr_str)
 		memcpy(&iok_info->directpath_pci, &nic_pci_addr, sizeof(nic_pci_addr));
+
+	initGlobalQuotaPool(&iok_info->global_pool);
 
 	addr.sun_family = AF_UNIX;
 
