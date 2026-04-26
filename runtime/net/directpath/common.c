@@ -197,6 +197,7 @@ int directpath_init_late(void)
 	flow_worker_th = thread_create(flow_registration_worker, NULL);
 	if (!flow_worker_th)
 		return -ENOMEM;
+	// log_info("[flow_registration_worker] Created flow registration worker thread %p", flow_worker_th);
 
 	return 0;
 }

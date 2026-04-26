@@ -153,5 +153,7 @@ void synchronize_rcu(void)
  */
 int rcu_init_late(void)
 {
-	return thread_spawn(rcu_worker, NULL);
+	int ret = thread_spawn(rcu_worker, NULL);
+	// log_info("[rcu_init_late] create uthread (rcu_worker)");
+	return ret;
 }

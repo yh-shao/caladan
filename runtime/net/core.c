@@ -657,6 +657,7 @@ static int net_tx_local_loopback(struct mbuf *m_in, uint8_t proto)
 				log_err_ratelimited("failed to spawn loopback thread");
 				mbuf_drop(m);
 			}
+			// log_info("[net_tx_local_loopback] create uthread (net_rx_trans)");
 			break;
 		default:
 			/* don't support ping etc for now */
@@ -775,6 +776,7 @@ int net_init_thread(void)
 	th = thread_create(iokernel_softirq, k);
 	if (!th)
 		return -ENOMEM;
+	// log_info("[net_init_thread] Created iokernel softirq thread %p for kthread %d", th, kthread_idx(k));
 
 	k->iokernel_softirq = th;
 

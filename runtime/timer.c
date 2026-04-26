@@ -404,6 +404,7 @@ int timer_init_thread(void)
 	th = thread_create(timer_softirq, k);
 	if (!th)
 		return -ENOMEM;
+	// log_info("[timer_init_thread] Created timer softirq thread %p for kthread %d", th, kthread_idx(k));
 
 	k->timer_softirq = th;
 	k->next_timer_tsc = UINT64_MAX;

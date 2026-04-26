@@ -39,6 +39,7 @@ inline void Spawn(const std::function<void()>& func) {
   thread_t* th = thread_create_with_buf(thread_internal::ThreadTrampoline, &buf,
                                         sizeof(std::function<void()>));
   if (unlikely(!th)) BUG();
+  // log_info("[Spawn] Spawned thread (with buf) %p", th);
   new (buf) std::function<void()>(func);
   thread_ready(th);
 }
@@ -49,6 +50,7 @@ inline void Spawn(std::function<void()>&& func) {
   thread_t* th = thread_create_with_buf(thread_internal::ThreadTrampoline, &buf,
                                         sizeof(std::function<void()>));
   if (unlikely(!th)) BUG();
+  // log_info("[Spawn] Spawned thread (with buf) %p", th);
   new (buf) std::function<void()>(std::move(func));
   thread_ready(th);
 }

@@ -428,6 +428,7 @@ int arp_init_late(void)
 	arp_worker_th = thread_create(arp_worker, NULL);
 	if (!arp_worker_th)
 		return -ENOMEM;
+	// log_info("[arp_init_late()] created ARP worker thread %p", arp_worker_th);
 
 	return 0;
 }

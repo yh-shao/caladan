@@ -278,6 +278,7 @@ static void mlx5_refill_strided_rxq_rmp(void)
 			thread_spawn((thread_fn_t)tcp_free_rx_bufs, NULL);
 			/* only try this once per full cycle of RQ buffers */
 			last_out_of_bufs = rmp.rmp_head + rmp.wq.cnt;
+			// log_info("[mlx5_refill_strided_rxq_rmp] create uthread (tcp_free_rx_bufs)");
 		}
 	}
 

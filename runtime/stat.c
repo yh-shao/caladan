@@ -187,6 +187,7 @@ static void stat_tcp_server(void *arg)
 		ret = tcp_accept(q, &c);
 		BUG_ON(ret);
 		ret = thread_spawn(stat_tcp_worker, c);
+		// log_info("[stat_tcp_server] create uthread (stat_tcp_worker)");
 		WARN_ON(ret);
 	}
 }
@@ -240,6 +241,8 @@ int stat_init_late(void)
 	ret = thread_spawn(stat_tcp_server, NULL);
 	if (ret)
 		return ret;
-
-	return thread_spawn(stat_worker_udp, NULL);
+	// log_info("[stat_init_late] create uthread (stat_tcp_server)");
+	ret = thread_spawn(stat_worker_udp, NULL);
+	// log_info("[stat_init_late] create uthread (stat_worker_udp)");
+	return ret;
 }

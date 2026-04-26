@@ -42,6 +42,7 @@ static int thread_spawn_joinable(struct join_handle **handle,
 					     sizeof(struct join_handle));
 	if (t == NULL)
 		return -ENOMEM;
+	// log_info("[thread_spawn_joinable()] created thread %p with buf on kthread %u", t, this_thread_id());
 
 	j->fn = fn;
 	j->args = arg;

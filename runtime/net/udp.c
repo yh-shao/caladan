@@ -829,6 +829,7 @@ static void udp_par_recv(struct trans_entry *e, struct mbuf *m)
 		mbuf_drop(m);
 		return;
 	}
+	// log_info("[udp_par_recv] Spawned thread %p with buf on kthread %u", th, this_thread_id());
 
 	d->buf = mbuf_data(m);
 	d->len = mbuf_length(m);

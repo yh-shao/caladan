@@ -121,7 +121,11 @@ static void tcp_handle_timeouts(tcpconn_t *c, uint64_t now)
 	if (do_probe)
 		tcp_tx_probe_window(c);
 	if (do_retransmit)
+	{
 		thread_spawn(tcp_retransmit, c);
+		// log_info("[tcp_handle_timeouts] create uthread (tcp_retransmit)");
+	}
+		
 }
 
 /* a periodic background thread that handles timeout events */
@@ -1622,5 +1626,7 @@ void tcpq_poll_install_cb(tcpqueue_t *q, poll_notif_fn_t setfn,
  */
 int tcp_init_late(void)
 {
-	return thread_spawn(tcp_worker, NULL);
+	int ret = thread_spawn(tcp_worker, NULL);
+	// log_info("[tcp_init_late] create uthread (tcp_worker)");
+	return ret;
 }
