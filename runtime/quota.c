@@ -97,6 +97,7 @@ static bool try_borrow_global(QuotaInfo *Quota, int64_t cost_iops, int64_t cost_
     return true;
 }
 
+#if 0
 bool ifQuotaPermit(uint64_t IOsize)
 {
     QuotaInfo* Q = &runtime_info->Q;
@@ -128,6 +129,12 @@ bool ifQuotaPermit(uint64_t IOsize)
 
 	return success;
 }
+#else
+bool ifQuotaPermit(uint64_t IOsize)
+{
+    return true;
+}
+#endif
 
 // void perform_io(Task *t, uint64_t size) 
 // {
