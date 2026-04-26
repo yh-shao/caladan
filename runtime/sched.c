@@ -80,6 +80,7 @@ static inline bool cores_have_affinity(unsigned int cpua, unsigned int cpub)
  */
 static void jmp_thread(thread_t *th)
 {
+	// log_info("(jmp_thread) switching to thread %p on kthread %u", th, this_thread_id());
 	assert_preempt_disabled();
 	assert(th->thread_ready == true);
 
@@ -114,6 +115,7 @@ static void jmp_thread(thread_t *th)
  */
 static void jmp_thread_direct(thread_t *oldth, thread_t *newth)
 {
+	// log_info("(jmp_thread_direct) switching from thread %p to thread %p on kthread %u", oldth, newth, this_thread_id());
 	assert_preempt_disabled();
 	assert(newth->thread_ready == true);
 
@@ -373,15 +375,20 @@ static __noinline void schedule(void)
 	}
 
 	/* if it's been too long, run the softirq handler */
-	if (!disable_watchdog &&
-	    unlikely(start_tsc - l->last_softirq_tsc >=
-	             cycles_per_us * RUNTIME_WATCHDOG_US)) {
-		l->last_softirq_tsc = start_tsc;
-		if (do_watchdog(l))
-		{
-			log_info("kthread %u: watchdog softirq did work", kthread_idx(l));
-			goto done;
-		}
+	// if (!disable_watchdog &&
+	//     unlikely(start_tsc - l->last_softirq_tsc >=
+	//              cycles_per_us * RUNTIME_WATCHDOG_US)) {
+	// 	l->last_softirq_tsc = start_tsc;
+	// 	if (do_watchdog(l))
+	// 	{
+	// 		// log_info("kthread %u: watchdog softirq did work", kthread_idx(l));
+	// 		goto done;
+	// 	}
+	// }
+	if (do_watchdog(l))
+	{
+		// log_info("kthread %u: watchdog softirq did work", kthread_idx(l));
+		goto done;
 	}
 
 	/* move overflow tasks into the runqueue */
@@ -541,6 +548,7 @@ static __always_inline void enter_schedule(thread_t *curth)
 	if (unlikely(th == curth)) {
 		th->thread_ready = false;
 		preempt_enable();
+		// log_info("dont need to switch threads, continue running thread %p on kthread %u", th, this_thread_id());
 		return;
 	}
 
@@ -884,6 +892,7 @@ thread_t *thread_create(thread_fn_t fn, void *arg)
 	thread_t *th = __thread_create();
 	if (unlikely(!th))
 		return NULL;
+	// log_info("[thread_create()] created thread %p", th);
 
 	th->tf.rsp = stack_init_to_rsp(th->stack, thread_exit);
 	th->tf.rdi = (uint64_t)arg;
@@ -907,6 +916,7 @@ thread_t *thread_create_with_buf(thread_fn_t fn, void **buf, size_t buf_len)
 	thread_t *th = __thread_create();
 	if (unlikely(!th))
 		return NULL;
+	// log_info("[thread_create_with_buf()] created thread %p", th);
 
 	th->tf.rsp = stack_init_to_rsp_with_buf(th->stack, &ptr, buf_len,
 						thread_exit);
@@ -929,6 +939,7 @@ int thread_spawn(thread_fn_t fn, void *arg)
 	thread_t *th = thread_create(fn, arg);
 	if (unlikely(!th))
 		return -ENOMEM;
+	// log_info("[thread_spawn()] created thread %p", th);
 	thread_ready(th);
 	return 0;
 }
@@ -953,6 +964,7 @@ int thread_spawn_main(thread_fn_t fn, void *arg)
 	th = thread_create(fn, arg);
 	if (!th)
 		return -ENOMEM;
+	// log_info("[thread_spawn_main()] created main thread %p", th);
 	th->main_thread = true;
 	thread_ready(th);
 	return 0;

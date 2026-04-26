@@ -63,8 +63,8 @@ static const struct init_entry thread_init_handlers[] = {
 	THREAD_INITIALIZER(smalloc),
 
 	/* network stack */
-	THREAD_INITIALIZER(net),
-	THREAD_INITIALIZER(directpath),
+	// THREAD_INITIALIZER(net),
+	// THREAD_INITIALIZER(directpath),
 
 	/* storage */
 	THREAD_INITIALIZER(storage),
@@ -219,9 +219,9 @@ int runtime_init(const char *cfgpath, thread_fn_t main_fn, void *arg)
 	ret = thread_spawn_main(main_fn, arg);
 	BUG_ON(ret);
 
-	ret = run_init_handlers("late", late_init_handlers,
-				ARRAY_SIZE(late_init_handlers));
-	BUG_ON(ret);
+	// ret = run_init_handlers("late", late_init_handlers,
+	// 			ARRAY_SIZE(late_init_handlers));
+	// BUG_ON(ret);
 
 	if (late_init_hook) {
 		ret = late_init_hook();
