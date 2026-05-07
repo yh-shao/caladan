@@ -53,7 +53,7 @@ int kthread_init_thread(void)
 	mbufq_init(&mykthread->txpktq_overflow);
 	mbufq_init(&mykthread->txcmdq_overflow);
 	spin_lock_init(&mykthread->timer_lock);
-	list_head_init(&mykthread->pending_dsa_jobs);   // 初始化 DSA 任务链表
+	list_head_init(&mykthread->pending_async_ops);
 
 	mykthread->tid = thread_gettid();
 
@@ -63,8 +63,7 @@ int kthread_init_thread(void)
 	iok.threads[kthread_idx(mykthread)].tid = ret;
 
 	// log_info("Runtime Logical Core %d is running on Linux Physical CPU %d",  mykthread->curr_cpu, sched_getcpu());
-
-	log_info("kthread %u [tid: %d] | initialized pending_dsa_jobs list at %p", perthread_read(thread_id), mykthread->tid, &mykthread->pending_dsa_jobs);
+	// log_info("kthread %u [tid: %d] | initialized pending_async_ops list at %p", perthread_read(thread_id), mykthread->tid, &mykthread->pending_async_ops);
 	return 0;
 }
 

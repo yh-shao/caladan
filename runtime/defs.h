@@ -23,18 +23,7 @@
 #include <runtime/thread.h>
 #include <runtime/rcu.h>
 #include <runtime/preempt.h>
-
-#include <dml/dml.h>
-struct dsa_req 
-{
-    thread_t*           waiting_th;    // 发起拷贝的 uthread
-    struct list_node    link;          // 用于挂入 kthread 的链表
-	dml_job_t           job;           // DML 任务描述符（需要放到最后）
-};
-extern int dsa_req_pool_init(size_t req_size);
-extern struct dsa_req *dsa_req_alloc(void);
-extern void dsa_req_free(struct dsa_req *req);
-extern void dsa_req_enqueue_and_park(struct dsa_req *req);
+#include <runtime/async.h>
 
 /*
  * constant limits
@@ -383,7 +372,7 @@ struct kthread {
 	/* 10th cache-line, statistics counters */
 	uint64_t		stats[STAT_NR];
 
-	struct list_head    pending_dsa_jobs;
+	struct list_head    pending_async_ops;
 } __aligned(CACHE_LINE_SIZE * 2);
 
 /* compile-time verification of cache-line alignment */
@@ -546,6 +535,8 @@ extern int preferred_socket;
  */
 
 extern bool disable_watchdog;
+extern bool runtime_async_pending(struct kthread *k);
+extern bool runtime_async_process(struct kthread *k);
 extern bool softirq_pending(struct kthread *k, uint64_t now_tsc);
 extern bool softirq_run_locked(struct kthread *k);
 extern bool softirq_run(void);
