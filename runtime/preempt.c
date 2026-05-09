@@ -144,8 +144,6 @@ void preempt(void)
 		return;
 	}
 
-	log_info("preempt: kthread[%d] preempt_needed", k->tid);
-
 	clear_preempt_needed();
 
 	/*
@@ -155,14 +153,12 @@ void preempt(void)
 	 */
 
 	if (preempt_cede_needed(k)) {
-		log_info("preempt: kthread[%d] ceding", k->tid);
 		thread_cede();
 		return;
 	}
 
 	if (preempt_yield_needed(k)) {
 		putk();
-		log_info("preempt: kthread[%d] yielding", k->tid);
 		thread_yield();
 		return;
 	}

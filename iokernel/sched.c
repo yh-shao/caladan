@@ -342,13 +342,14 @@ int sched_yield_on_core(unsigned int core)
 	if (!th)
 		return -ENOENT;
 
+	uint64_t rcu_gen = ACCESS_ONCE(th->q_ptrs->rcu_gen);
 	/* check to make sure the last yield request finished */
-	if (th->last_yield_rcu_gen == th->metrics.rcu_gen)
+	if (th->last_yield_rcu_gen == rcu_gen)
 		return 0;
 
 	/* send the yield signal */
-	th->last_yield_rcu_gen = th->metrics.rcu_gen;
-	ACCESS_ONCE(th->q_ptrs->yield_rcu_gen) = th->metrics.rcu_gen;
+	th->last_yield_rcu_gen = rcu_gen;
+	ACCESS_ONCE(th->q_ptrs->yield_rcu_gen) = rcu_gen;
 	ksched_enqueue_intr(core, KSCHED_INTR_YIELD);
 	return 0;
 }

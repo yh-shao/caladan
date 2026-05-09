@@ -138,7 +138,7 @@ static void check_spdk_and_preempt(void)
     struct thread *th;
     int i, j;
     uint32_t cons_idx;
-	bool work_done = false;
+    bool sent_intr = false;
 
     for (i = 0; i < dp.nr_clients; i++)   // 遍历所有 Runtime（进程）
 	{
@@ -159,11 +159,10 @@ static void check_spdk_and_preempt(void)
 				{
 					// log_info("[DEBUG] ready to send UIPI to core %d for SPDK IO", th->core);
                     // ksched_enqueue_intr(th->core, KSCHED_INTR_YIELD);
-					sched_yield_on_core(th->core);
-					// __builtin_ia32_senduipi(th->core);
+					if (sched_yield_on_core(th->core) == 0) sent_intr = true;
+                    // __builtin_ia32_senduipi(th->core);
 					// safe_senduipi(th->core);
                     th->last_storage_cons_idx = cons_idx;  // 更新状态，防止对同一批 IO 重复发送
-					work_done = true;
                 }
                 th->storage_was_busy = true;
             } 
@@ -175,7 +174,7 @@ static void check_spdk_and_preempt(void)
         }
     }
 
-	// if (work_done) ksched_send_intrs();
+	if (sent_intr) ksched_send_intrs();
 }
 
 /*
@@ -207,7 +206,7 @@ void dataplane_loop(void)
 
 		/* handle a burst of ingress packets */
 		work_done |= rx_burst();
-		// check_spdk_and_preempt();
+		check_spdk_and_preempt();
 
 		work_done |= dma_dequeue();
 

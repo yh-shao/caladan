@@ -49,7 +49,11 @@ struct nvme_device {
 static void seq_complete(void *arg, const struct spdk_nvme_cpl *completion)
 {
 	struct thread *th = arg;
-	thread_ready(th);
+
+	if (runtime_info && atomic64_read(&runtime_info->spdk_uipi))
+		thread_ready_head(th);
+	else
+		thread_ready(th);
 }
 
 static bool probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid, struct spdk_nvme_ctrlr_opts *opts)
@@ -632,7 +636,10 @@ int block_next_sge(void *arg, void **address, uint32_t *length)
 void vectorIO_complete(void *arg, const struct spdk_nvme_cpl *cpl)
 {
     struct vectorIO_ctx *ctx = (struct vectorIO_ctx *)arg;
-	thread_ready(ctx->th);
+	if (runtime_info && atomic64_read(&runtime_info->spdk_uipi))
+		thread_ready_head(ctx->th);
+	else
+		thread_ready(ctx->th);
 }
 
 int read_blocks_from_disk(uint64_t lba_start, uint32_t lba_count, void* blockentries[])

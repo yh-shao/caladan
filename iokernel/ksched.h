@@ -153,7 +153,6 @@ static inline void ksched_send_intrs(void)
 	if (ksched_has_uintr && !ksched_pmc_count) {
 		/* use senduipi instruction if there's just one interrupt */
 		if (ksched_count == 1) {
-			log_info("sending UIPI to core %d", last_intr_core);
 			__builtin_ia32_senduipi(last_intr_core);
 			goto done;
 		}
