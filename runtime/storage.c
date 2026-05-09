@@ -56,7 +56,7 @@ static bool probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid, st
 {
     log_info("Probing device: %s ... ", trid->traddr);
 
-    const char *target_addr = "0000:5a:00.0";           // 只绑定这个盘（因为目前我只用到一个盘）
+    const char *target_addr = "0000:5b:00.0";           // 只绑定这个盘（因为目前我只用到一个盘）
     if (strcasecmp(trid->traddr, target_addr) == 0)
     {
         log_info("Matched target address %s. Attaching...\n", target_addr);
