@@ -51,6 +51,19 @@ void __weak on_sched(thread_t *th) {}
  */
 thread_t *thread_self(void);
 
+static inline uint64_t thread_fsbase_to_run(thread_t *th)
+{
+	if (!th->has_fsbase) th->fsbase = perthread_read(runtime_fsbase);
+	if (th->runtime_fsbase_depth) return perthread_read(runtime_fsbase);
+	return th->fsbase;
+}
+static inline void thread_save_fsbase(thread_t *th)
+{
+	uint64_t fsbase = _readfsbase_u64();
+	if (th->runtime_fsbase_depth && fsbase == perthread_read(runtime_fsbase)) return;
+	th->fsbase = fsbase;
+}
+
 void thread_set_fsbase(thread_t *th, uint64_t fsbase)
 {
 	th->fsbase = fsbase;
@@ -92,10 +105,7 @@ static void jmp_thread(thread_t *th)
 			cpu_relax();
 	}
 
-	if (!th->has_fsbase)
-		th->fsbase = perthread_read(runtime_fsbase);
-
-	set_fsbase(th->fsbase);
+	set_fsbase(thread_fsbase_to_run(th));
 
 	th->thread_running = true;
 
@@ -127,10 +137,7 @@ static void jmp_thread_direct(thread_t *oldth, thread_t *newth)
 			cpu_relax();
 	}
 
-	if (!newth->has_fsbase)
-		newth->fsbase = perthread_read(runtime_fsbase);
-
-	set_fsbase(newth->fsbase);
+	set_fsbase(thread_fsbase_to_run(newth));
 
 	newth->thread_running = true;
 
@@ -570,7 +577,7 @@ static __always_inline void enter_schedule(thread_t *curth)
 void thread_park_and_unlock_np(spinlock_t *l)
 {
 	thread_t *curth = thread_self();
-	curth->fsbase = _readfsbase_u64();    // 旧 uthread 的 fsbase 也应该作为 context 的一部分，被保存呀？
+	thread_save_fsbase(curth);
 
 	assert_preempt_disabled();
 	assert_spin_lock_held(l);
@@ -585,7 +592,7 @@ void thread_park_and_unlock_np(spinlock_t *l)
 void thread_park_and_preempt_enable(void)
 {
 	thread_t *curth = thread_self();
-	curth->fsbase = _readfsbase_u64();    // 旧 uthread 的 fsbase 也应该作为 context 的一部分，被保存呀？
+	thread_save_fsbase(curth);
 
 	assert_preempt_disabled();
 	enter_schedule(curth);
@@ -871,6 +878,7 @@ static __always_inline thread_t *__thread_create(void)
 	th->tlsvar = 0;
 	th->junction_thread = false;
 	th->link_armed = false;
+	th->runtime_fsbase_depth = 0;
 	th->cur_kthread = NCPU;
 	// Can be used to detect newly created thread.
 	th->ready_tsc = 0;

@@ -30,6 +30,7 @@ struct thread {
 	/* modified by interrupt handler; should not be shared with other bitfields */
 	bool	xsave_area_in_use:1;
 	atomic8_t	interrupt_state;
+	uint8_t		runtime_fsbase_depth;   // 表示当前 uthread 是否处于“主动切换到 runtime FS base 的区域”内，支持嵌套 guard
 	struct thread_tf	*entry_regs;
 	unsigned long	junction_tstate_buf[8];
 	struct stack	*stack;
