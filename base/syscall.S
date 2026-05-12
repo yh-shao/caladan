@@ -97,6 +97,13 @@ syscall_mprotect:
 	ret
 
 .align 16
+.globl syscall_mlock
+syscall_mlock:
+	movl    $__NR_mlock, %eax
+	syscall
+	ret
+
+.align 16
 .globl syscall_exit
 syscall_exit:
 	movl    $__NR_exit_group, %eax

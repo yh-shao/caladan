@@ -12,7 +12,9 @@ uint64_t num_blocks;
 #include <stdio.h>
 #include <base/hash.h>
 #include <base/log.h>
+#include <base/mem.h>
 #include <base/mempool.h>
+#include <base/syscall.h>
 #include <runtime/sync.h>
 
 // Hack to prevent SPDK from pulling in extra headers here
@@ -36,6 +38,19 @@ struct mempool storage_buf_mp;
 static struct tcache *storage_buf_tcache;
 static DEFINE_PERTHREAD(struct tcache_perthread, storage_buf_pt);
 
+#define USER_DMA_CACHE_SIZE 4096
+BUILD_ASSERT(is_power_of_two(USER_DMA_CACHE_SIZE));
+struct user_dma_page {
+	uintptr_t base;
+};
+static struct user_dma_page user_dma_pages[USER_DMA_CACHE_SIZE];
+static DEFINE_SPINLOCK(user_dma_lock);             // 保护 user_dma_pages[] cache 的访问
+
+static bool user_dma_registered_logged;
+static bool user_dma_failed_logged;     // 控制日志打印频率，无论成功或失败的日志，在整个生命周期中只打印一次
+
+static DEFINE_SPINLOCK(user_dma_register_lock);    // 保护 spdk_mem_register 的调用
+
 struct nvme_device {
 	const char *name;
 	unsigned long latency_us;
@@ -46,6 +61,118 @@ struct nvme_device {
 	}
 };
 
+static size_t user_dma_cache_slot(uintptr_t page_base)
+{
+	return (page_base >> PGSHIFT_2MB) & (USER_DMA_CACHE_SIZE - 1);
+}
+
+static bool user_dma_cache_lookup(uintptr_t reg_base, uintptr_t reg_end)
+{
+	for (uintptr_t page = reg_base; page < reg_end; page += PGSIZE_2MB) 
+		if (user_dma_pages[user_dma_cache_slot(page)].base != page) return false;
+	return true;
+}
+
+static void user_dma_cache_insert(uintptr_t reg_base, uintptr_t reg_end)
+{
+	for (uintptr_t page = reg_base; page < reg_end; page += PGSIZE_2MB)
+		user_dma_pages[user_dma_cache_slot(page)].base = page;
+}
+
+static bool user_dma_range_vtophys_ok(void *buf, size_t len)
+{
+	uintptr_t pos = (uintptr_t)buf;
+	uintptr_t end = pos + len;
+
+	while (pos < end) 
+	{
+		uint64_t chunk = end - pos;
+		uint64_t iova = spdk_vtophys((void *)pos, &chunk);
+		if (unlikely(iova == SPDK_VTOPHYS_ERROR || chunk == 0)) return false;
+		pos += chunk;
+	}
+	return true;
+}
+
+static int storage_register_user_dma(void *buf, size_t len)
+{
+	uintptr_t addr = (uintptr_t)buf;
+	uintptr_t end = addr + len;
+	int rc;
+
+	if (unlikely(buf == NULL || len == 0 || end < addr)) return -EINVAL;
+	if (unlikely((addr & PGMASK_2MB) != 0 || (len & PGMASK_2MB) != 0)) return -EINVAL;
+
+	spin_lock(&user_dma_lock);
+	if (user_dma_cache_lookup(addr, end))    // 查本地 2MB 页粒度 cache：user_dma_pages[]，避免重复注册；如果 cache 没命中，再进行后续的 mlock + spdk_mem_register
+	{
+		spin_unlock(&user_dma_lock);
+		return user_dma_range_vtophys_ok(buf, len) ? 0 : -EFAULT;
+	}
+	spin_unlock(&user_dma_lock);
+
+	rc = syscall_mlock(buf, len);            // 调用 syscall_mlock(buf, len)，把用户页 pin 在内存中，避免 DMA 过程中被换出
+	if (unlikely(rc != 0)) 
+	{
+		if (!user_dma_failed_logged) 
+		{
+			user_dma_failed_logged = true;
+			log_err("storage: mlock user DMA region failed rc=%d base=%p len=%zu", rc, buf, len);
+		}
+		return rc;
+	}
+
+	preempt_disable();
+	spin_lock(&user_dma_register_lock);
+	rc = spdk_mem_register(buf, len);         // 调用 spdk_mem_register(buf, len)，让 SPDK/DPDK/VFIO 建立用户虚拟地址到 IOVA 的映射
+	if (unlikely(rc == -EBUSY))   // 说明可能部分页面已经注册过，则按 2MB 页面逐段注册
+	{
+		uintptr_t seg = addr;
+		while (seg < end) 
+		{
+			rc = spdk_mem_register((void *)seg, PGSIZE_2MB);
+			if (rc != 0 && rc != -EBUSY) break;
+			seg += PGSIZE_2MB;
+		}
+	}
+	spin_unlock(&user_dma_register_lock);
+	preempt_enable();
+	if (unlikely(rc != 0 && rc != -EBUSY)) 
+	{
+		if (!user_dma_failed_logged) 
+		{
+			user_dma_failed_logged = true;
+			log_err("storage: spdk_mem_register user buffer failed rc=%d base=%p len=%zu", rc, buf, len);
+		}
+		return rc;
+	}
+	if (unlikely(!user_dma_range_vtophys_ok(buf, len)))  // 调用 spdk_vtophys() 遍历整个范围，确认每一段都能转换为可 DMA 的 IOVA
+	{
+		if (!user_dma_failed_logged) 
+		{
+			user_dma_failed_logged = true;
+			log_err("storage: user DMA vtophys validation failed base=%p len=%zu", buf, len);
+		}
+		return -EFAULT;
+	}
+
+	spin_lock(&user_dma_lock);
+	user_dma_cache_insert(addr, end);   // 成功后把 2MB page base 写入 user_dma_pages[] cache，加速后续相同页面的注册
+	spin_unlock(&user_dma_lock);
+
+	if (!user_dma_registered_logged) 
+	{
+		user_dma_registered_logged = true;
+		log_info("storage: enabled direct DMA into user buffers");
+	}
+	return 0;
+}
+
+int storage_prepare_user_dma(void *buf, size_t len)
+{
+	return storage_register_user_dma(buf, len);
+}
+
 static void seq_complete(void *arg, const struct spdk_nvme_cpl *completion)
 {
 	struct thread *th = arg;
@@ -54,6 +181,23 @@ static void seq_complete(void *arg, const struct spdk_nvme_cpl *completion)
 		thread_ready_head(th);
 	else
 		thread_ready(th);
+}
+
+struct storage_completion {
+	struct thread *thread;
+	int status;
+};
+static void seq_status_complete(void *arg, const struct spdk_nvme_cpl *completion)
+{
+	struct storage_completion *ctx = arg;
+
+	ctx->status = spdk_nvme_cpl_is_error(completion) ? -EIO : 0;
+	barrier();
+
+	if (runtime_info && atomic64_read(&runtime_info->spdk_uipi))
+		thread_ready_head(ctx->thread);
+	else
+		thread_ready(ctx->thread);
 }
 
 static bool probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid, struct spdk_nvme_ctrlr_opts *opts)
@@ -300,6 +444,80 @@ int storage_read(void* dest, uint64_t lba, uint32_t lba_count)               // 
 int storage_read_obj(void* obj, size_t siz, uint64_t lba_start, off_t oft)   // buffer 的长度应至少为 siz
 {
     return __storage_read(obj, siz, lba_start, oft);
+}
+
+int storage_read_aligned(void* dest, uint64_t lba, uint32_t lba_count)
+{
+	if (!cfg_storage_enabled) return -ENODEV;
+	if (unlikely(lba_count == 0)) return 0;
+	if (unlikely(dest == NULL || block_size == 0)) return -EINVAL;
+	if (unlikely(((uintptr_t)dest & (block_size - 1)) != 0)) return -EINVAL;
+
+	int rc;
+
+	size_t bytes = (size_t)lba_count * block_size;
+	if (unlikely(bytes / block_size != lba_count)) return -EINVAL;
+
+	if (unlikely(!user_dma_range_vtophys_ok(dest, bytes))) 
+	{
+		rc = storage_register_user_dma(dest, bytes);
+		if (unlikely(rc != 0)) return rc;
+	}
+
+	struct storage_completion completion = { .thread = thread_self(), .status = -EIO, };
+	struct kthread *k = getk();
+	struct storage_q *q = &k->storage_q;
+
+	spin_lock(&q->lock);
+	rc = spdk_nvme_ns_cmd_read(spdk_namespace, q->spdk_qp_handle, dest, lba, lba_count, seq_status_complete, &completion, 0);
+	if (unlikely(rc != 0)) 
+	{
+		log_err("storage_read_aligned(): spdk_nvme_ns_cmd_read failed with rc=%d", rc);
+		spin_unlock(&q->lock);
+		putk();
+		return -EIO;
+	}
+
+	q->outstanding_reqs++;
+	thread_park_and_unlock_np(&q->lock);
+	return completion.status;
+}
+
+int storage_write_user_dma(const void *src, uint64_t lba, uint32_t lba_count)
+{
+	if (!cfg_storage_enabled) return -ENODEV;
+	if (unlikely(lba_count == 0)) return 0;
+	if (unlikely(src == NULL || block_size == 0)) return -EINVAL;
+	if (unlikely(((uintptr_t)src & (block_size - 1)) != 0)) return -EINVAL;
+
+	int rc;
+
+	size_t bytes = (size_t)lba_count * block_size;
+	if (unlikely(bytes / block_size != lba_count)) return -EINVAL;
+
+	if (unlikely(!user_dma_range_vtophys_ok((void *)src, bytes))) 
+	{
+		rc = storage_register_user_dma((void *)src, bytes);
+		if (unlikely(rc != 0)) return rc;
+	}
+
+	struct storage_completion completion = { .thread = thread_self(), .status = -EIO, };
+	struct kthread *k = getk();
+	struct storage_q *q = &k->storage_q;
+
+	spin_lock(&q->lock);
+	rc = spdk_nvme_ns_cmd_write(spdk_namespace, q->spdk_qp_handle, (void *)src, lba, lba_count, seq_status_complete, &completion, 0);
+	if (unlikely(rc != 0)) 
+	{
+		log_err("storage_write_user_dma(): spdk_nvme_ns_cmd_write failed with rc=%d", rc);
+		spin_unlock(&q->lock);
+		putk();
+		return -EIO;
+	}
+
+	q->outstanding_reqs++;
+	thread_park_and_unlock_np(&q->lock);
+	return completion.status;
 }
 
 static int storage_softirq_one(struct storage_q *q)
@@ -714,6 +932,11 @@ int storage_write(const void *payload, uint64_t lba, uint32_t lba_count)
 }
 
 int storage_read(void *dest, uint64_t lba, uint32_t lba_count)
+{
+	return -ENODEV;
+}
+
+int storage_read_aligned(void *dest, uint64_t lba, uint32_t lba_count)
 {
 	return -ENODEV;
 }

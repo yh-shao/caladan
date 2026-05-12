@@ -22,6 +22,7 @@ extern void syscall_rt_sigreturn(void);
 extern int syscall_ioctl(int fd, unsigned long int request, void *arg);
 extern int syscall_madvise(void *addr, size_t length, int advice);
 extern int syscall_mprotect(void *addr, size_t len, int prot);
+extern int syscall_mlock(const void *addr, size_t len);
 extern ssize_t syscall_pwritev2(int fd, const struct iovec *iov, int iovcnt,
 	                            off_t offset_lo, off_t offset_hi, int flags);
 
