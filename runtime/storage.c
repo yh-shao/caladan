@@ -94,41 +94,52 @@ static bool user_dma_range_vtophys_ok(void *buf, size_t len)
 	return true;
 }
 
-static int storage_register_user_dma(void *buf, size_t len)
+static bool user_dma_registration_range(void *buf, size_t len, uintptr_t *reg_base, uintptr_t *reg_end)
 {
 	uintptr_t addr = (uintptr_t)buf;
 	uintptr_t end = addr + len;
+
+	if (unlikely(buf == NULL || len == 0 || end < addr)) return false;
+	if (unlikely((addr & PGMASK_4KB) != 0 || (len & PGMASK_4KB) != 0)) return false;
+
+	*reg_base = PGADDR_2MB(addr);
+	*reg_end = align_up(end, PGSIZE_2MB);
+	return *reg_end > *reg_base;
+}
+
+static int storage_register_user_dma(void *buf, size_t len)
+{
+	uintptr_t reg_base, reg_end;
 	int rc;
 
-	if (unlikely(buf == NULL || len == 0 || end < addr)) return -EINVAL;
-	if (unlikely((addr & PGMASK_2MB) != 0 || (len & PGMASK_2MB) != 0)) return -EINVAL;
+	if (unlikely(!user_dma_registration_range(buf, len, &reg_base, &reg_end))) return -EINVAL;
 
-	spin_lock(&user_dma_lock);
-	if (user_dma_cache_lookup(addr, end))    // 查本地 2MB 页粒度 cache：user_dma_pages[]，避免重复注册；如果 cache 没命中，再进行后续的 mlock + spdk_mem_register
+	spin_lock_np(&user_dma_lock);
+	if (user_dma_cache_lookup(reg_base, reg_end))    // 查本地 2MB 页粒度 cache：user_dma_pages[]，避免重复注册；如果 cache 没命中，再进行后续的 mlock + spdk_mem_register
 	{
-		spin_unlock(&user_dma_lock);
+		spin_unlock_np(&user_dma_lock);
 		return user_dma_range_vtophys_ok(buf, len) ? 0 : -EFAULT;
 	}
-	spin_unlock(&user_dma_lock);
+	spin_unlock_np(&user_dma_lock);
 
-	rc = syscall_mlock(buf, len);            // 调用 syscall_mlock(buf, len)，把用户页 pin 在内存中，避免 DMA 过程中被换出
+	rc = syscall_mlock((void *)reg_base, reg_end - reg_base);            // 把覆盖 user buffer 的 2MB 注册区 pin 在内存中，避免 DMA 过程中被换出
 	if (unlikely(rc != 0)) 
 	{
 		if (!user_dma_failed_logged) 
 		{
 			user_dma_failed_logged = true;
-			log_err("storage: mlock user DMA region failed rc=%d base=%p len=%zu", rc, buf, len);
+			log_err("storage: mlock user DMA region failed rc=%d base=%p len=%zu", rc, (void *)reg_base, (size_t)(reg_end - reg_base));
 		}
 		return rc;
 	}
 
 	preempt_disable();
 	spin_lock(&user_dma_register_lock);
-	rc = spdk_mem_register(buf, len);         // 调用 spdk_mem_register(buf, len)，让 SPDK/DPDK/VFIO 建立用户虚拟地址到 IOVA 的映射
+	rc = spdk_mem_register((void *)reg_base, reg_end - reg_base);         // SPDK/DPDK/VFIO 以 2MB 粒度建立虚拟地址到 IOVA 的映射
 	if (unlikely(rc == -EBUSY))   // 说明可能部分页面已经注册过，则按 2MB 页面逐段注册
 	{
-		uintptr_t seg = addr;
-		while (seg < end) 
+		uintptr_t seg = reg_base;
+		while (seg < reg_end) 
 		{
 			rc = spdk_mem_register((void *)seg, PGSIZE_2MB);
 			if (rc != 0 && rc != -EBUSY) break;
@@ -142,7 +153,7 @@ static int storage_register_user_dma(void *buf, size_t len)
 		if (!user_dma_failed_logged) 
 		{
 			user_dma_failed_logged = true;
-			log_err("storage: spdk_mem_register user buffer failed rc=%d base=%p len=%zu", rc, buf, len);
+			log_err("storage: spdk_mem_register user buffer failed rc=%d base=%p len=%zu", rc, (void *)reg_base, (size_t)(reg_end - reg_base));
 		}
 		return rc;
 	}
@@ -156,9 +167,9 @@ static int storage_register_user_dma(void *buf, size_t len)
 		return -EFAULT;
 	}
 
-	spin_lock(&user_dma_lock);
-	user_dma_cache_insert(addr, end);   // 成功后把 2MB page base 写入 user_dma_pages[] cache，加速后续相同页面的注册
-	spin_unlock(&user_dma_lock);
+	spin_lock_np(&user_dma_lock);
+	user_dma_cache_insert(reg_base, reg_end);   // 成功后把 2MB page base 写入 user_dma_pages[] cache，加速后续相同页面的注册
+	spin_unlock_np(&user_dma_lock);
 
 	if (!user_dma_registered_logged) 
 	{
