@@ -531,6 +531,88 @@ int storage_write_user_dma(const void *src, uint64_t lba, uint32_t lba_count)
 	return completion.status;
 }
 
+struct storage_batch_completion {
+	struct thread* thread;
+	unsigned int remaining;
+	int status;
+};
+static void batch_status_complete(void *arg, const struct spdk_nvme_cpl *completion)
+{
+	struct storage_batch_completion *ctx = arg;
+
+	if (spdk_nvme_cpl_is_error(completion)) ctx->status = -EIO;
+	barrier();
+
+	if (--ctx->remaining == 0) 
+	{
+		if (runtime_info && atomic64_read(&runtime_info->spdk_uipi)) thread_ready_head(ctx->thread);
+		else thread_ready(ctx->thread);
+	}
+}
+int storage_read_aligned_batch(struct storage_batch_read *reqs, unsigned int nr)
+{
+	struct storage_batch_completion completion = {};
+	struct kthread *k;
+	struct storage_q *q;
+	unsigned int submitted = 0;
+	int rc;
+
+	if (!cfg_storage_enabled) return -ENODEV;
+	if (unlikely(nr == 0)) return 0;
+	if (unlikely(reqs == NULL)) return -EINVAL;
+
+	for (unsigned int i = 0; i < nr; i++) 
+	{
+		size_t bytes;
+
+		if (unlikely(reqs[i].lba_count == 0)) return -EINVAL;
+		if (unlikely(reqs[i].dest == NULL || block_size == 0)) return -EINVAL;
+		if (unlikely(((uintptr_t)reqs[i].dest & (block_size - 1)) != 0)) return -EINVAL;
+
+		bytes = (size_t)reqs[i].lba_count * block_size;
+		if (unlikely(bytes / block_size != reqs[i].lba_count)) return -EINVAL;
+		if (unlikely(!user_dma_range_vtophys_ok(reqs[i].dest, bytes))) 
+		{
+			rc = storage_register_user_dma(reqs[i].dest, bytes);
+			if (unlikely(rc != 0)) return rc;
+		}
+	}
+
+	completion.thread = thread_self();
+	completion.status = 0;
+
+	k = getk();
+	q = &k->storage_q;
+
+	spin_lock(&q->lock);
+	for (unsigned int i = 0; i < nr; i++) 
+	{
+		rc = spdk_nvme_ns_cmd_read(spdk_namespace, q->spdk_qp_handle, reqs[i].dest, reqs[i].lba, reqs[i].lba_count, batch_status_complete, &completion, 0);
+		if (unlikely(rc != 0)) 
+		{
+			if (i == 0) 
+			{
+				spin_unlock(&q->lock);
+				putk();
+				return -EIO;
+			}
+			completion.status = -EIO;
+			break;
+		}
+		q->outstanding_reqs++;
+		submitted++;
+	}
+	if (unlikely(submitted == 0)) 
+	{
+		spin_unlock(&q->lock);
+		putk();
+		return -EIO;
+	}
+	completion.remaining = submitted;
+	thread_park_and_unlock_np(&q->lock);
+	return completion.status;
+}
+
 static int storage_softirq_one(struct storage_q *q)
 {
 	int ret;
@@ -948,6 +1030,11 @@ int storage_read(void *dest, uint64_t lba, uint32_t lba_count)
 }
 
 int storage_read_aligned(void *dest, uint64_t lba, uint32_t lba_count)
+{
+	return -ENODEV;
+}
+
+int storage_read_aligned_batch(struct storage_batch_read *reqs, unsigned int nr)
 {
 	return -ENODEV;
 }

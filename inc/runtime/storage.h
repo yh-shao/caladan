@@ -16,6 +16,13 @@ extern int storage_prepare_user_dma(void* buf, size_t len);                     
 extern int storage_read_aligned(void* dest, uint64_t lba, uint32_t lba_count);         // 直接用用户 buffer 作为 spdk_nvme_ns_cmd_read() 的 payload，直接把盘上数据读取到 user buffer 里
 extern int storage_write_user_dma(const void* src, uint64_t lba, uint32_t lba_count);  // 直接把用户 buffer 作为 spdk_nvme_ns_cmd_write() 的 payload，直接把用户 buffer 里的数据写到盘上
 
+struct storage_batch_read {
+	void*    dest;
+	uint64_t lba;
+	uint32_t lba_count;
+};
+extern int storage_read_aligned_batch(struct storage_batch_read *reqs, unsigned int nr);
+
 bool DMA_read_block(void* buf, uint64_t lba);
 bool DMA_write_block(const void* buf, uint64_t lba);
 
