@@ -924,6 +924,7 @@ struct vectorIO_ctx
 {
     struct block_sgl_ctx sgl;
 	thread_t *th;
+	int status;
 };
 
 void block_reset_sgl(void *arg, uint32_t offset)
@@ -947,6 +948,8 @@ int block_next_sge(void *arg, void **address, uint32_t *length)
 void vectorIO_complete(void *arg, const struct spdk_nvme_cpl *cpl)
 {
     struct vectorIO_ctx *ctx = (struct vectorIO_ctx *)arg;
+	ctx->status = spdk_nvme_cpl_is_error(cpl) ? -EIO : 0;
+	barrier();
 	if (runtime_info && atomic64_read(&runtime_info->spdk_uipi))
 		thread_ready_head(ctx->th);
 	else
@@ -966,6 +969,7 @@ int read_blocks_from_disk(uint64_t lba_start, uint32_t lba_count, void* blockent
 	ctx.sgl.num_blocks = lba_count;
 	ctx.sgl.block_size = block_size;
 	ctx.sgl.cur_index = 0;
+	ctx.status = -EIO;
 
 	struct kthread   *k = getk();
     struct storage_q *q = &k->storage_q;
@@ -983,9 +987,12 @@ int read_blocks_from_disk(uint64_t lba_start, uint32_t lba_count, void* blockent
 		q->outstanding_reqs++;
 	}
 	thread_park_and_unlock_np(&q->lock);
+	preempt_disable();
 
 	// log_info("read_blocks_from_disk() DONE: have read %u blocks from LBA %lu to blockcache", lba_count, lba_start);
-	return 0;
+	int status = ctx.status;
+	preempt_enable();
+	return status;
 }
 
 int write_blocks_to_disk(uint64_t lba_start, uint32_t lba_count, void* blockentries[])
@@ -999,6 +1006,7 @@ int write_blocks_to_disk(uint64_t lba_start, uint32_t lba_count, void* blockentr
     ctx.sgl.num_blocks = lba_count;
     ctx.sgl.block_size = block_size;
     ctx.sgl.cur_index = 0;
+	ctx.status = -EIO;
 
     struct kthread *k = getk();
     struct storage_q *q = &k->storage_q;
@@ -1014,8 +1022,11 @@ int write_blocks_to_disk(uint64_t lba_start, uint32_t lba_count, void* blockentr
 
     q->outstanding_reqs++;
     thread_park_and_unlock_np(&q->lock);
+	preempt_disable();
 
-    return 0;
+	int status = ctx.status;
+	preempt_enable();
+    return status;
 }
 
 #else
