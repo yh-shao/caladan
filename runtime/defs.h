@@ -437,17 +437,6 @@ static __always_inline __nofp void putk(void)
 /* preempt_cede_needed - check if kthread should cede */
 static __always_inline __nofp bool preempt_cede_needed(struct kthread *k)
 {
-	if (k == NULL)
-	{
-		log_info("preempt_cede_needed: k is NULL !!!!!!!!!!!!!");
-		return false;
-	}
-	if (k->q_ptrs == NULL)
-	{
-		log_info("preempt_cede_needed: k->q_ptrs is NULL !!!!!!!!!!!!!");
-		return false;
-	}
-
 	return k->q_ptrs->curr_grant_gen ==
 	       ACCESS_ONCE(k->q_ptrs->cede_gen);
 }
