@@ -486,6 +486,11 @@ extern unsigned int spinks;
 extern unsigned int maxks;
 extern unsigned int guaranteedks;
 extern bool cfg_prio_is_lc;
+extern bool cfg_storage_quota_enabled;
+extern bool cfg_storage_quota_borrow_global_enabled;
+extern uint64_t cfg_storage_quota_refill_us;
+extern uint64_t cfg_storage_quota_iops;
+extern uint64_t cfg_storage_quota_bytes;
 extern unsigned int cfg_request_hardware_queues;
 extern uint64_t cfg_ht_punish_us;
 extern uint64_t cfg_qdelay_us;
@@ -716,6 +721,11 @@ extern int arp_init(void);
 extern int trans_init(void);
 extern int smalloc_init(void);
 extern int storage_init(void);
+extern void storage_quota_init_runtime(void);
+extern int storage_quota_wait(uint32_t iops, uint64_t bytes);
+extern bool storage_quota_try_acquire(uint32_t iops, uint64_t bytes);
+extern void storage_quota_refund(uint32_t iops, uint64_t bytes);
+extern void storage_quota_account(uint32_t iops, uint64_t bytes);
 extern int directpath_init(void);
 
 /* late initialization */

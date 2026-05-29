@@ -32,9 +32,12 @@
 
 #define BORROW_BATCH      0.1                     // 每次借贷的批量比例 (10%)
 
+#define QUOTA_DEFAULT_REFILL_US ((uint64_t)(REFILL_TIME * TO_US))
+
 typedef struct {
-    volatile int64_t bucket;    // 当前桶内余额
+    volatile int64_t bucket;    // runtime 从该共享桶批量领取本地 token，避免每次 IO 原子扣减
     volatile int64_t quota;     // 当前分配配额
+    volatile uint64_t epoch;    // iokernel 每次重新分配配额时递增，runtime 据此刷新本地 token
     volatile int64_t demand;    // 周期内申请使用量
     
     /* Admin 专用字段 (仅 Admin 进程读写) */
@@ -45,8 +48,11 @@ typedef struct {
 
 typedef struct {
     int         priority;  // TODO：删掉
+    atomic64_t   enabled;  // runtime 控制开关；为 0 时 iokernel 不做 quota refill
+    spinlock_t   lock;     // 保护 iokernel refill 与 runtime 批量取 token 的共享桶状态
     QuotaDim    iops;
     QuotaDim    bytes;
+    atomic64_t   wake_epoch; // iokernel 通知 runtime 有新的 quota epoch，可重新检查 quota waiters
 } QuotaInfo;
 // static int iops_offset  = offsetof(QuotaInfo, iops);
 // static int bytes_offset = offsetof(QuotaInfo, bytes);

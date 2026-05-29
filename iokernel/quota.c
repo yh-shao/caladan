@@ -39,7 +39,9 @@ double calc_target(int type, QuotaInfo* Quota)  // 计算 task 在下一周期�
 
     if (q->init == 0) 
     {
-        q->target = q->ewma = MaxAvailable * DEFAULT_RATIO;  // 初始值
+        int64_t demand = __atomic_exchange_n(&q->demand, 0, __ATOMIC_SEQ_CST);
+        q->ewma = demand > 0 ? demand : MaxAvailable * DEFAULT_RATIO;
+        q->target = MAX(q->ewma, MaxAvailable * DEFAULT_RATIO);
         q->init = 1;
     }
     else
@@ -59,6 +61,14 @@ double calc_target(int type, QuotaInfo* Quota)  // 计算 task 在下一周期�
     return q->target;
 }
 
+static void quota_assign_dim(QuotaDim* q, int64_t assign)
+{
+    if (assign < 1) assign = 1;
+    __atomic_store_n(&q->bucket, assign, __ATOMIC_RELEASE);
+    __atomic_store_n(&q->quota, assign, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&q->epoch, 1, __ATOMIC_RELEASE);
+}
+
 void refillQuota(void)
 {
     // log_info("Refilling Quotas...");
@@ -73,8 +83,9 @@ void refillQuota(void)
 		if (unlikely(!p->runtime_info)) continue;
 
         QuotaInfo* Quota = &p->runtime_info->Q;
+        if (atomic64_read(&Quota->enabled) == 0) continue;
         double res1 = calc_target(0, Quota), res2 = calc_target(1, Quota);
-        if (p->sched_cfg.priority == 1) 
+        if (p->sched_cfg.priority == SCHED_PRIO_LC)
         {
             D_H_op += res1;
             D_H_bw += res2;
@@ -88,7 +99,7 @@ void refillQuota(void)
 
     total_D_op = D_H_op + D_L_op;
     double L_op = total_D_op / TOTAL_IOPS_ALLOCABLE;
-    double Q_H_op, Q_L_op;
+    double Q_H_op = 0, Q_L_op = 0;
     if (L_op > 1.0) 
     {
         Q_H_op = MIN(D_H_op, TOTAL_IOPS_ALLOCABLE - MIN(D_L_op, TOTAL_IOPS_ALLOCABLE * THETA));
@@ -97,7 +108,7 @@ void refillQuota(void)
     
     total_D_bw = D_H_bw + D_L_bw;
     double L_bw = total_D_bw / TOTAL_BW_ALLOCABLE;
-    double Q_H_bw, Q_L_bw;
+    double Q_H_bw = 0, Q_L_bw = 0;
     if (L_bw > 1.0) 
     {
         Q_H_bw = MIN(D_H_bw, TOTAL_BW_ALLOCABLE - MIN(D_L_bw, TOTAL_BW_ALLOCABLE * THETA));
@@ -112,35 +123,40 @@ void refillQuota(void)
 		if (unlikely(!p->runtime_info)) continue;
         
         QuotaInfo* Quota = &p->runtime_info->Q;
+        if (atomic64_read(&Quota->enabled) == 0) continue;
 
         double assign_op = 0;
         if (L_op <= 1.0) assign_op = ceil(Quota->iops.target); 
         else 
         {
-            if (p->sched_cfg.priority == 1) assign_op = (D_H_op > 0) ? ceil((Quota->iops.target / D_H_op) * Q_H_op) : 0;
+            if (p->sched_cfg.priority == SCHED_PRIO_LC) assign_op = (D_H_op > 0) ? ceil((Quota->iops.target / D_H_op) * Q_H_op) : 0;
             else                            assign_op = (D_L_op > 0) ? ceil((Quota->iops.target / D_L_op) * Q_L_op) : 0;
         }
-        __atomic_store_n(&Quota->iops.quota,  (int64_t)assign_op, __ATOMIC_SEQ_CST);
-        __atomic_store_n(&Quota->iops.bucket, (int64_t)assign_op, __ATOMIC_SEQ_CST);
+        spin_lock(&Quota->lock);
+        quota_assign_dim(&Quota->iops, (int64_t)assign_op);
         final_sum_op += assign_op;
 
         double assign_bw = 0;
         if (L_bw <= 1.0) assign_bw = ceil(Quota->bytes.target);
         else 
         {
-            if (p->sched_cfg.priority == 1) assign_bw = (D_H_bw > 0) ? ceil((Quota->bytes.target / D_H_bw) * Q_H_bw) : 0;
+            if (p->sched_cfg.priority == SCHED_PRIO_LC) assign_bw = (D_H_bw > 0) ? ceil((Quota->bytes.target / D_H_bw) * Q_H_bw) : 0;
             else                            assign_bw = (D_L_bw > 0) ? ceil((Quota->bytes.target / D_L_bw) * Q_L_bw) : 0;
         }
-        __atomic_store_n(&Quota->bytes.quota,  (int64_t)assign_bw, __ATOMIC_SEQ_CST);
-        __atomic_store_n(&Quota->bytes.bucket, (int64_t)assign_bw, __ATOMIC_SEQ_CST);
+        quota_assign_dim(&Quota->bytes, (int64_t)assign_bw);
+        spin_unlock(&Quota->lock);
         final_sum_bw += assign_bw;
+
+        atomic64_fetch_and_add(&Quota->wake_epoch, 1);
     }
 
     double g_ops_val = HARDWARE_IOPS * REFILL_TIME - final_sum_op, g_bw_val = HARDWARE_BW * REFILL_TIME - final_sum_bw;
+    if (g_ops_val < 0) g_ops_val = 0;
+    if (g_bw_val < 0) g_bw_val = 0;
 
     spin_lock(&global_pool->l);
     __atomic_store_n(&global_pool->iops,  (int64_t)g_ops_val, __ATOMIC_RELAXED);
     __atomic_store_n(&global_pool->bytes, (int64_t)g_bw_val,  __ATOMIC_RELAXED);
     spin_unlock(&global_pool->l);
-    if (final_sum_op > 0 || final_sum_bw > 0) log_info("Refill done: total assigned IOPS quota = %.0f, BW quota = %.0f", final_sum_op, final_sum_bw);
+    if (final_sum_op > 0 || final_sum_bw > 0) log_debug("Refill done: total assigned IOPS quota = %.0f, BW quota = %.0f", final_sum_op, final_sum_bw);
 }

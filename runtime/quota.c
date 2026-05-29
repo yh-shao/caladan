@@ -1,145 +1,322 @@
+#include <errno.h>
 #include <iokernel/quota.h>
+#include <base/time.h>
+#include <runtime/timer.h>
 #include "defs.h"
 
-// bool atomic_conditional_decrement(volatile uint64_t *ptr, uint64_t amount) 
-// {
-//     uint64_t old_val = __atomic_load_n(ptr, __ATOMIC_RELAXED);
-//     while (true) 
-//     {
-//         if (old_val < amount) return false;
-//         uint64_t new_val = old_val - amount;
-//         if (__atomic_compare_exchange_n(ptr, &old_val, new_val, true, __ATOMIC_SEQ_CST, __ATOMIC_RELAXED)) return true;
-//     }
-// }
+bool cfg_storage_quota_enabled;
+bool cfg_storage_quota_borrow_global_enabled = true;
+uint64_t cfg_storage_quota_refill_us = QUOTA_DEFAULT_REFILL_US;
+uint64_t cfg_storage_quota_iops = HARDWARE_IOPS;
+uint64_t cfg_storage_quota_bytes = HARDWARE_BW;
 
-static bool try_consume(QuotaInfo *Quota, int64_t cost_iops, int64_t cost_bytes) 
+#define QUOTA_BORROW_MIN_IOPS  1024
+#define QUOTA_BORROW_MIN_BYTES (4ULL * 1024 * 1024)
+
+struct quota_bucket {
+    int64_t tokens;
+    int64_t quota;
+    uint64_t epoch;
+};
+
+struct storage_quota_local {
+    struct quota_bucket iops;
+    struct quota_bucket bytes;
+    uint64_t wake_epoch;
+    bool initialized;
+};
+
+static DEFINE_PERTHREAD(struct storage_quota_local, storage_quota_local);
+
+static inline int64_t quota_max_i64(int64_t a, int64_t b) { return a > b ? a : b; }
+
+static inline bool quota_runtime_ready(void)
 {
-    // 先粗略看一眼，如果不够，直接跳过，减少原子写竞争
-    int64_t peek_iops  = __atomic_load_n(&Quota->iops.bucket,  __ATOMIC_RELAXED);
-    int64_t peek_bytes = __atomic_load_n(&Quota->bytes.bucket, __ATOMIC_RELAXED);
-    if (peek_iops < cost_iops || peek_bytes < cost_bytes) return false;
+    return cfg_storage_quota_enabled && runtime_info != NULL;
+}
 
-    /* 乐观扣除 -> 检查 -> 失败则回滚 */
+static inline void quota_refresh_one(struct quota_bucket *local, QuotaDim *shared)
+{
+    uint64_t epoch = __atomic_load_n(&shared->epoch, __ATOMIC_ACQUIRE);
+    if (likely(local->epoch == epoch)) return;
 
-    // 尝试扣除 IOPS
-    int64_t old_iops = __atomic_fetch_sub(&Quota->iops.bucket, cost_iops, __ATOMIC_SEQ_CST);
-    if (old_iops < cost_iops)   // IOPS 不足，回滚
-    {
-        __atomic_fetch_add(&Quota->iops.bucket, cost_iops, __ATOMIC_SEQ_CST);
+    int64_t quota = __atomic_load_n(&shared->quota, __ATOMIC_RELAXED);
+    if (quota < 0) quota = 0;
+
+    local->quota = quota;
+    local->tokens = 0;
+    local->epoch = epoch;
+}
+
+static inline void quota_refresh_local_locked(void)
+{
+    struct storage_quota_local *local_quota = perthread_ptr(storage_quota_local);
+    QuotaInfo *q = &runtime_info->Q;
+
+    quota_refresh_one(&local_quota->iops, &q->iops);
+    quota_refresh_one(&local_quota->bytes, &q->bytes);
+    local_quota->wake_epoch = atomic64_read(&q->wake_epoch);
+    local_quota->initialized = true;
+}
+
+static inline void quota_refresh_local(void)
+{
+    QuotaInfo *q = &runtime_info->Q;
+
+    spin_lock(&q->lock);
+    quota_refresh_local_locked();
+    spin_unlock(&q->lock);
+}
+
+void storage_quota_init_runtime(void)
+{
+    memset(perthread_ptr(storage_quota_local), 0, sizeof(struct storage_quota_local));
+    if (!runtime_info) return;
+
+    QuotaInfo *q = &runtime_info->Q;
+    memset(q, 0, sizeof(*q));
+    spin_lock_init(&q->lock);
+    atomic64_write(&q->enabled, cfg_storage_quota_enabled ? 1 : 0);
+
+    if (!cfg_storage_quota_enabled) return;
+
+    int64_t iops_quota = (int64_t)((cfg_storage_quota_iops * QUOTA_DEFAULT_REFILL_US + TO_US - 1) / TO_US);
+    int64_t bytes_quota = (int64_t)((cfg_storage_quota_bytes * QUOTA_DEFAULT_REFILL_US + TO_US - 1) / TO_US);
+    if (iops_quota <= 0) iops_quota = 1;
+    if (bytes_quota <= 0) bytes_quota = 1;
+
+    __atomic_store_n(&q->iops.bucket, iops_quota, __ATOMIC_RELEASE);
+    __atomic_store_n(&q->bytes.bucket, bytes_quota, __ATOMIC_RELEASE);
+    __atomic_store_n(&q->iops.quota, iops_quota, __ATOMIC_RELEASE);
+    __atomic_store_n(&q->bytes.quota, bytes_quota, __ATOMIC_RELEASE);
+    __atomic_store_n(&q->iops.epoch, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&q->bytes.epoch, 1, __ATOMIC_RELEASE);
+    atomic64_write(&q->wake_epoch, 1);
+}
+
+void storage_quota_account(uint32_t iops, uint64_t bytes)
+{
+    if (!quota_runtime_ready()) return;
+    __atomic_fetch_add(&runtime_info->Q.iops.demand, (int64_t)iops, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&runtime_info->Q.bytes.demand, (int64_t)bytes, __ATOMIC_RELAXED);
+}
+
+static bool quota_consume_local(uint32_t iops, uint64_t bytes)
+{
+    struct storage_quota_local *local_quota = perthread_ptr(storage_quota_local);
+
+    if (!local_quota->initialized ||
+        local_quota->iops.epoch != __atomic_load_n(&runtime_info->Q.iops.epoch, __ATOMIC_ACQUIRE) ||
+        local_quota->bytes.epoch != __atomic_load_n(&runtime_info->Q.bytes.epoch, __ATOMIC_ACQUIRE))
+        quota_refresh_local();
+
+    int64_t cost_iops = (int64_t)iops;
+    int64_t cost_bytes = (int64_t)bytes;
+    if (local_quota->iops.tokens < cost_iops || local_quota->bytes.tokens < cost_bytes)
         return false;
-    }
 
-    // 尝试扣除 Bytes
-    int64_t old_bytes = __atomic_fetch_sub(&Quota->bytes.bucket, cost_bytes, __ATOMIC_SEQ_CST);
-    if (old_bytes < cost_bytes) // Bytes 不足
-    {
-        __atomic_fetch_add(&Quota->bytes.bucket, cost_bytes, __ATOMIC_SEQ_CST);  // 回滚 Bytes
-        __atomic_fetch_add(&Quota->iops.bucket,  cost_iops,  __ATOMIC_SEQ_CST);  // 并回滚刚才扣掉的 IOPS
-        return false;
-    }
-
-    // 两个都扣除成功
+    local_quota->iops.tokens -= cost_iops;
+    local_quota->bytes.tokens -= cost_bytes;
     return true;
 }
 
-static bool try_borrow_global(QuotaInfo *Quota, int64_t cost_iops, int64_t cost_bytes)
+static bool quota_consume_local_ready(struct storage_quota_local *local_quota,
+                                      uint32_t iops, uint64_t bytes)
 {
-    int64_t cur_iops  = __atomic_load_n(&Quota->iops.bucket,  __ATOMIC_RELAXED);
-    int64_t cur_bytes = __atomic_load_n(&Quota->bytes.bucket, __ATOMIC_RELAXED);
-    log_info("try_borrow_global: current bucket iops = %ld, bytes = %ld", cur_iops, cur_bytes);
-    if (cur_iops  < 0) cur_iops = 0;    // 如果因并发回滚导致为负，视为 0 处理
-    if (cur_bytes < 0) cur_bytes = 0;
+    int64_t cost_iops = (int64_t)iops;
+    int64_t cost_bytes = (int64_t)bytes;
 
-    // 计算需求缺口
-    int64_t need_iops  = MAX(cost_iops  - cur_iops,  0);
-    int64_t need_bytes = MAX(cost_bytes - cur_bytes, 0);
-    log_info("try_borrow_global: need to borrow iops = %ld, bytes = %ld", need_iops, need_bytes);
-    if (need_iops == 0 && need_bytes == 0) return true;  // 不需要借贷
-    
-
-    log_info("here1");
-    GlobalQuotaPool* global_pool = &iok.iok_info->global_pool;
-    log_info("here2");
-    spin_lock(&global_pool->l);
-    log_info("here3");
-    
-    int64_t g_iops  = __atomic_load_n(&global_pool->iops,  __ATOMIC_RELAXED);
-    int64_t g_bytes = __atomic_load_n(&global_pool->bytes, __ATOMIC_RELAXED);
-    log_info("try_borrow_global: current global pool iops = %ld, bytes = %ld", g_iops, g_bytes);
-
-    if (g_iops < need_iops || g_bytes < need_bytes) 
-    {
-        spin_unlock(&global_pool->l);
+    if (local_quota->iops.tokens < cost_iops || local_quota->bytes.tokens < cost_bytes)
         return false;
-    }
-    if (cfg_prio_is_lc == 0 && (g_iops < HARDWARE_IOPS * REFILL_TIME * VIP_RSV || g_bytes < HARDWARE_BW * REFILL_TIME * VIP_RSV))   // 权限检查 (VIP 水位)
-    {
-        spin_unlock(&global_pool->l);
-        return false;
-    } 
 
-    // 计算借贷量 (Quota 的 10% 或 刚好够用)
-    int64_t borrow_iops = need_iops;
-    if (g_iops >= __atomic_load_n(&Quota->iops.quota,  __ATOMIC_RELAXED) * BORROW_BATCH)  borrow_iops  = MAX(need_iops,  __atomic_load_n(&Quota->iops.quota,  __ATOMIC_RELAXED) * BORROW_BATCH);
-    int64_t borrow_bytes = need_bytes;
-    if (g_bytes >= __atomic_load_n(&Quota->bytes.quota, __ATOMIC_RELAXED) * BORROW_BATCH) borrow_bytes = MAX(need_bytes, __atomic_load_n(&Quota->bytes.quota, __ATOMIC_RELAXED) * BORROW_BATCH);
-    
-    log_info("try_borrow_global: borrowing iops = %ld, bytes = %ld", borrow_iops, borrow_bytes);
-    
-    // 执行借贷
-    __atomic_store_n(&global_pool->iops,  g_iops - borrow_iops,   __ATOMIC_RELAXED);
-    __atomic_store_n(&global_pool->bytes, g_bytes - borrow_bytes, __ATOMIC_RELAXED);    
-    __atomic_fetch_add(&Quota->iops.bucket,  borrow_iops,  __ATOMIC_SEQ_CST);
-    __atomic_fetch_add(&Quota->bytes.bucket, borrow_bytes, __ATOMIC_SEQ_CST);
-    
-    spin_unlock(&global_pool->l); 
-
+    local_quota->iops.tokens -= cost_iops;
+    local_quota->bytes.tokens -= cost_bytes;
     return true;
 }
 
-#if 0
+static int64_t quota_batch_amount(int64_t need, int64_t quota, int64_t floor)
+{
+    if (need <= 0) return 0;
+
+    int64_t batch = need;
+    if (quota > 0)
+    {
+        int64_t quota_batch = (int64_t)(quota * BORROW_BATCH);
+        if (quota_batch > batch) batch = quota_batch;
+    }
+    if (batch < floor) batch = floor;
+    if (batch < need) batch = need;
+    return batch;
+}
+
+static bool quota_try_pull_shared(uint32_t iops, uint64_t bytes)
+{
+    struct storage_quota_local *local_quota = perthread_ptr(storage_quota_local);
+    QuotaInfo *q = &runtime_info->Q;
+
+    spin_lock(&q->lock);
+    quota_refresh_local_locked();
+    if (quota_consume_local_ready(local_quota, iops, bytes))
+    {
+        spin_unlock(&q->lock);
+        return true;
+    }
+
+    int64_t need_iops = quota_max_i64((int64_t)iops - local_quota->iops.tokens, 0);
+    int64_t need_bytes = quota_max_i64((int64_t)bytes - local_quota->bytes.tokens, 0);
+    if (need_iops == 0 && need_bytes == 0)
+    {
+        spin_unlock(&q->lock);
+        return true;
+    }
+
+    int64_t pull_iops = quota_batch_amount(need_iops, local_quota->iops.quota, 0);
+    int64_t pull_bytes = quota_batch_amount(need_bytes, local_quota->bytes.quota, 0);
+
+    int64_t old_iops = __atomic_load_n(&q->iops.bucket, __ATOMIC_RELAXED);
+    int64_t old_bytes = __atomic_load_n(&q->bytes.bucket, __ATOMIC_RELAXED);
+    if (old_iops < need_iops || old_bytes < need_bytes)
+    {
+        spin_unlock(&q->lock);
+        return false;
+    }
+
+    if (pull_iops > old_iops) pull_iops = old_iops;
+    if (pull_bytes > old_bytes) pull_bytes = old_bytes;
+    __atomic_store_n(&q->iops.bucket, old_iops - pull_iops, __ATOMIC_RELEASE);
+    __atomic_store_n(&q->bytes.bucket, old_bytes - pull_bytes, __ATOMIC_RELEASE);
+
+    local_quota->iops.tokens += pull_iops;
+    local_quota->bytes.tokens += pull_bytes;
+    bool ok = quota_consume_local_ready(local_quota, iops, bytes);
+    spin_unlock(&q->lock);
+    return ok;
+}
+
+static bool quota_try_borrow_global(uint32_t iops, uint64_t bytes)
+{
+    if (!cfg_storage_quota_borrow_global_enabled) return false;
+    if (!iok.iok_info) return false;
+
+    QuotaInfo *q = &runtime_info->Q;
+    spin_lock(&q->lock);
+    quota_refresh_local_locked();
+    struct storage_quota_local *local_quota = perthread_ptr(storage_quota_local);
+    if (quota_consume_local_ready(local_quota, iops, bytes))
+    {
+        spin_unlock(&q->lock);
+        return true;
+    }
+
+    int64_t need_iops = quota_max_i64((int64_t)iops - local_quota->iops.tokens, 0);
+    int64_t need_bytes = quota_max_i64((int64_t)bytes - local_quota->bytes.tokens, 0);
+    if (need_iops == 0 && need_bytes == 0)
+    {
+        spin_unlock(&q->lock);
+        return true;
+    }
+
+    int64_t borrow_iops = quota_batch_amount(need_iops, local_quota->iops.quota, QUOTA_BORROW_MIN_IOPS);
+    int64_t borrow_bytes = quota_batch_amount(need_bytes, local_quota->bytes.quota, QUOTA_BORROW_MIN_BYTES);
+
+    GlobalQuotaPool *global = (GlobalQuotaPool *)&iok.iok_info->global_pool;
+    spin_lock(&global->l);
+
+    int64_t g_iops = __atomic_load_n(&global->iops, __ATOMIC_RELAXED);
+    int64_t g_bytes = __atomic_load_n(&global->bytes, __ATOMIC_RELAXED);
+    int64_t reserve_iops = 0, reserve_bytes = 0;
+
+    if (!cfg_prio_is_lc)
+    {
+        reserve_iops = (int64_t)(cfg_storage_quota_iops * VIP_RSV * QUOTA_DEFAULT_REFILL_US / TO_US);
+        reserve_bytes = (int64_t)(cfg_storage_quota_bytes * VIP_RSV * QUOTA_DEFAULT_REFILL_US / TO_US);
+    }
+
+    int64_t cap_iops = g_iops - reserve_iops;
+    int64_t cap_bytes = g_bytes - reserve_bytes;
+    if ((need_iops > 0 && cap_iops < need_iops) ||
+        (need_bytes > 0 && cap_bytes < need_bytes))
+    {
+        spin_unlock(&global->l);
+        spin_unlock(&q->lock);
+        return false;
+    }
+    if (borrow_iops > 0 && borrow_iops > cap_iops) borrow_iops = cap_iops;
+    if (borrow_bytes > 0 && borrow_bytes > cap_bytes) borrow_bytes = cap_bytes;
+
+    __atomic_store_n(&global->iops, g_iops - borrow_iops, __ATOMIC_RELAXED);
+    __atomic_store_n(&global->bytes, g_bytes - borrow_bytes, __ATOMIC_RELAXED);
+    spin_unlock(&global->l);
+
+    local_quota->iops.tokens += borrow_iops;
+    local_quota->bytes.tokens += borrow_bytes;
+    bool ok = quota_consume_local_ready(local_quota, iops, bytes);
+    spin_unlock(&q->lock);
+    return ok;
+}
+
+static bool quota_try_acquire_tokens(uint32_t iops, uint64_t bytes)
+{
+    if (quota_consume_local(iops, bytes)) return true;
+    if (quota_try_pull_shared(iops, bytes)) return true;
+    if (quota_try_borrow_global(iops, bytes)) return true;
+    return false;
+}
+
+bool storage_quota_try_acquire(uint32_t iops, uint64_t bytes)
+{
+    if (!quota_runtime_ready()) return true;
+    if (unlikely(bytes > (uint64_t)INT64_MAX)) return false;
+
+    storage_quota_account(iops, bytes);
+    preempt_disable();
+    bool ok = quota_try_acquire_tokens(iops, bytes);
+    preempt_enable();
+    return ok;
+}
+
+void storage_quota_refund(uint32_t iops, uint64_t bytes)
+{
+    if (!quota_runtime_ready() || unlikely(bytes > (uint64_t)INT64_MAX)) return;
+
+    preempt_disable();
+    QuotaInfo *q = &runtime_info->Q;
+    spin_lock(&q->lock);
+    quota_refresh_local_locked();
+    struct storage_quota_local *local_quota = perthread_ptr(storage_quota_local);
+
+    if (local_quota->iops.tokens <= INT64_MAX - (int64_t)iops)
+        local_quota->iops.tokens += (int64_t)iops;
+    else
+        local_quota->iops.tokens = INT64_MAX;
+
+    if (local_quota->bytes.tokens <= INT64_MAX - (int64_t)bytes)
+        local_quota->bytes.tokens += (int64_t)bytes;
+    else
+        local_quota->bytes.tokens = INT64_MAX;
+    spin_unlock(&q->lock);
+    preempt_enable();
+}
+
+int storage_quota_wait(uint32_t iops, uint64_t bytes)
+{
+    if (!quota_runtime_ready()) return 0;
+    if (unlikely(bytes > (uint64_t)INT64_MAX)) return -EOVERFLOW;
+    storage_quota_account(iops, bytes);
+    uint64_t sleep_us = cfg_storage_quota_refill_us ? cfg_storage_quota_refill_us : QUOTA_DEFAULT_REFILL_US;
+
+    for (;;)
+    {
+        preempt_disable();
+        bool ok = quota_try_acquire_tokens(iops, bytes);
+        preempt_enable();
+        if (ok) return 0;
+
+        timer_sleep(sleep_us);
+    }
+}
+
 bool ifQuotaPermit(uint64_t IOsize)
 {
-    QuotaInfo* Q = &runtime_info->Q;
-
-    bool success = false;
-
-    if (try_consume(Q, 1, IOsize)) 
-    {
-        log_info("ifQuotaPermit: direct consume succeeded!");
-        success = true; 
-    }
-    else 
-    {
-        log_info("ifQuotaPermit: direct consume failed, trying to borrow from global pool...");
-        if (try_borrow_global(Q, 1, IOsize))
-        {
-            log_info("ifQuotaPermit: borrow from global pool succeeded!");
-            if (try_consume(Q, 1, IOsize)) 
-            {
-                log_info("ifQuotaPermit: consume after borrow succeeded!");
-                success = true;  // 借到了，再扣一次
-            }
-        }
-        else
-        {
-            log_info("ifQuotaPermit: borrow from global pool failed!");
-        }
-    }
-
-	return success;
+    return storage_quota_try_acquire(1, IOsize);
 }
-#else
-bool ifQuotaPermit(uint64_t IOsize)
-{
-    return true;
-}
-#endif
-
-// void perform_io(Task *t, uint64_t size) 
-// {
-//     __atomic_fetch_add(&Q->iops.demand, 1,       __ATOMIC_SEQ_CST);
-//     __atomic_fetch_add(&Q->bytes.demand, IOsize, __ATOMIC_SEQ_CST);
-//     while (!ifQuotaPermit(size)) thread_yield(); 
-//     // Do IO...
-// }

@@ -225,6 +225,55 @@ static int parse_runtime_quantum_us(const char *name, const char *val)
 	return 0;
 }
 
+static int parse_storage_quota_enabled(const char *name, const char *val)
+{
+	if (!strcmp(val, "true") || !strcmp(val, "1") || !strcmp(val, "on"))
+	{
+		if (!strcmp(name, "storage_quota_borrow_global"))
+			cfg_storage_quota_borrow_global_enabled = true;
+		else
+			cfg_storage_quota_enabled = true;
+	}
+	else if (!strcmp(val, "false") || !strcmp(val, "0") || !strcmp(val, "off"))
+	{
+		if (!strcmp(name, "storage_quota_borrow_global"))
+			cfg_storage_quota_borrow_global_enabled = false;
+		else
+			cfg_storage_quota_enabled = false;
+	}
+	else {
+		log_err("%s must be true or false", name);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int parse_storage_quota_u64(const char *name, const char *val)
+{
+	long tmp;
+	int ret;
+
+	ret = str_to_long(val, &tmp);
+	if (ret)
+		return ret;
+	if (tmp <= 0) {
+		log_err("%s must be positive", name);
+		return -EINVAL;
+	}
+
+	if (!strcmp(name, "storage_quota_refill_us"))
+		cfg_storage_quota_refill_us = tmp;
+	else if (!strcmp(name, "storage_quota_iops"))
+		cfg_storage_quota_iops = tmp;
+	else if (!strcmp(name, "storage_quota_bytes"))
+		cfg_storage_quota_bytes = tmp;
+	else
+		return -EINVAL;
+
+	return 0;
+}
+
 static int parse_mac_address(const char *name, const char *val)
 {
 	log_warn("specifying mac address is deprecated.");
@@ -380,6 +429,12 @@ static const struct cfg_handler cfg_handlers[] = {
 	{ "runtime_ht_punish_us", parse_runtime_ht_punish_us, false },
 	{ "runtime_qdelay_us", parse_runtime_qdelay_us, false },
 	{ "runtime_quantum_us", parse_runtime_quantum_us, false },
+	{ "quota_enabled", parse_storage_quota_enabled, false },
+	{ "storage_quota_enabled", parse_storage_quota_enabled, false },
+	{ "storage_quota_borrow_global", parse_storage_quota_enabled, false },
+	{ "storage_quota_refill_us", parse_storage_quota_u64, false },
+	{ "storage_quota_iops", parse_storage_quota_u64, false },
+	{ "storage_quota_bytes", parse_storage_quota_u64, false },
 	{ "static_arp", parse_static_arp_entry, false },
 	{ "log_level", parse_log_level, false },
 	{ "disable_watchdog", parse_watchdog_flag, false },
@@ -423,10 +478,25 @@ int cfg_load(const char *path)
 			line++;
 			continue;
 		}
-		name = strtok(buf, " ");
+		name = strtok(buf, " \t");
 		if (!name)
 			break;
-		val = strtok(NULL, " ");
+
+		val = strchr(name, '=');
+		if (val) {
+			*val = '\0';
+			val++;
+			if (*val == '\0')
+				val = strtok(NULL, " \t");
+		} else {
+			val = strtok(NULL, " \t");
+			if (val && val[0] == '=') {
+				if (val[1] != '\0')
+					val++;
+				else
+					val = strtok(NULL, " \t");
+			}
+		}
 
 		if (!val) {
 			log_err("config option with missing value on line %d", line);
@@ -506,6 +576,11 @@ int cfg_load(const char *path)
 #endif
 		 cfg_directpath_enabled() ? "enabled" : "disabled",
 		 cfg_transparent_hugepages_enabled ? "enabled" : "disabled");
+	log_info("cfg: storage quota %s (borrow_global=%s, refill_us=%lu, iops=%lu, bytes=%lu)",
+		 cfg_storage_quota_enabled ? "enabled" : "disabled",
+		 cfg_storage_quota_borrow_global_enabled ? "enabled" : "disabled",
+		 cfg_storage_quota_refill_us, cfg_storage_quota_iops,
+		 cfg_storage_quota_bytes);
 
 out:
 	fclose(f);

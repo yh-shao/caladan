@@ -212,13 +212,12 @@ void dataplane_loop(void)
 
 		/* adjust core assignments */
 		sched_poll();
-		// static uint64_t last_refill_time = 0;
-		// uint64_t now = microtime();
-		// if (now - last_refill_time >= REFILL_TIME * TO_US)   // 设置每隔 REFILL_TIME 执行一次
-		// {
-		// 	refillQuota();
-		// 	last_refill_time = now;
-		// }
+		static uint64_t last_refill_time = 0;
+		uint64_t now = microtime();
+		if (now - last_refill_time >= QUOTA_DEFAULT_REFILL_US) {
+			refillQuota();
+			last_refill_time = now;
+		}
 
 
 		/* drain overflow completion queues */

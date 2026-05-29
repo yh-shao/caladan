@@ -272,6 +272,8 @@ int ioqueues_init(void)
 	iok.threads = iok_shm_alloc(sizeof(*ts) * maxks, 0, NULL);
 	runtime_info = iok_shm_alloc(sizeof(struct runtime_info),
 	                             0, &iok.hdr->runtime_info);
+	memset(runtime_info, 0, sizeof(*runtime_info));
+	storage_quota_init_runtime();
 
 	/* first allocate q_ptrs in a contiguous array */
 	for (i = 0; i < maxks; i++) {

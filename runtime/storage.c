@@ -79,6 +79,33 @@ static void user_dma_cache_insert(uintptr_t reg_base, uintptr_t reg_end)
 		user_dma_pages[user_dma_cache_slot(page)].base = page;
 }
 
+enum storage_quota_op {
+	STORAGE_QUOTA_READ,
+	STORAGE_QUOTA_WRITE,
+};
+
+static inline int storage_quota_admit(enum storage_quota_op op, uint32_t lba_count)
+{
+	(void)op;
+	if (likely(!cfg_storage_quota_enabled)) return 0;
+	if (unlikely(block_size == 0)) return -EINVAL;
+	if (unlikely(lba_count == 0)) return 0;
+
+	size_t bytes = (size_t)lba_count * block_size;
+	if (unlikely(bytes / block_size != lba_count)) return -EINVAL;
+	return storage_quota_wait(1, bytes);
+}
+
+static inline void storage_quota_cancel(enum storage_quota_op op, uint32_t lba_count)
+{
+	(void)op;
+	if (likely(!cfg_storage_quota_enabled) || unlikely(block_size == 0) ||
+	    unlikely(lba_count == 0)) return;
+
+	size_t bytes = (size_t)lba_count * block_size;
+	if (likely(bytes / block_size == lba_count)) storage_quota_refund(1, bytes);
+}
+
 static bool user_dma_range_vtophys_ok(void *buf, size_t len)
 {
 	uintptr_t pos = (uintptr_t)buf;
@@ -123,7 +150,7 @@ static int storage_register_user_dma(void *buf, size_t len)
 	spin_unlock_np(&user_dma_lock);
 
 	rc = syscall_mlock((void *)reg_base, reg_end - reg_base);            // 把覆盖 user buffer 的 2MB 注册区 pin 在内存中，避免 DMA 过程中被换出
-	if (unlikely(rc != 0)) 
+	if (unlikely(rc != 0))
 	{
 		if (!user_dma_failed_logged) 
 		{
@@ -293,6 +320,21 @@ static int __storage_write(const void* src, size_t siz, uint64_t base_lba, off_t
 	size_t   req_size         = target_lba_count * block_size;                     // DMA Buffer 所需的实际大小
 
 	bool use_thread_cache = req_size <= REQUEST_BUF_SZ;
+	bool admit_rmw_read = rmw && siz < req_size;
+	int rc;
+
+	if (admit_rmw_read)
+	{
+		rc = storage_quota_admit(STORAGE_QUOTA_READ, target_lba_count);
+		if (unlikely(rc != 0)) return rc;
+	}
+
+	rc = storage_quota_admit(STORAGE_QUOTA_WRITE, target_lba_count);
+	if (unlikely(rc != 0))
+	{
+		if (admit_rmw_read) storage_quota_cancel(STORAGE_QUOTA_READ, target_lba_count);
+		return rc;
+	}
 
 	struct kthread* k = getk();
 	struct storage_q* q = &k->storage_q;
@@ -302,14 +344,15 @@ static int __storage_write(const void* src, size_t siz, uint64_t base_lba, off_t
         spdk_payload = tcache_alloc(perthread_ptr(storage_buf_pt));
     else
         spdk_payload = spdk_zmalloc(req_size, 0, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
-    if (unlikely(spdk_payload == NULL)) 
+	if (unlikely(spdk_payload == NULL))
 	{
 		log_err("__storage_write(): failed to allocate spdk_payload buffer");
+		storage_quota_cancel(STORAGE_QUOTA_WRITE, target_lba_count);
+		if (admit_rmw_read) storage_quota_cancel(STORAGE_QUOTA_READ, target_lba_count);
         putk();
         return -ENOMEM;
     }
 
-	int rc;
     if (rmw && siz < req_size)   // 如果是 RMW 且没有覆盖整个盘上区域（有未被新数据完全覆盖的盘上旧数据区域），先执行 Read
 	{
         spin_lock(&q->lock);
@@ -318,6 +361,8 @@ static int __storage_write(const void* src, size_t siz, uint64_t base_lba, off_t
 		{
 			log_err("__storage_write(): failed to issue read command for RMW with rc=%d", rc);
             spin_unlock(&q->lock);
+            storage_quota_cancel(STORAGE_QUOTA_READ, target_lba_count);
+            storage_quota_cancel(STORAGE_QUOTA_WRITE, target_lba_count);
             rc = -EIO;
             goto done_np;
         }
@@ -340,6 +385,7 @@ static int __storage_write(const void* src, size_t siz, uint64_t base_lba, off_t
 	{
 		log_err("__storage_write(): spdk_nvme_ns_cmd_write failed with rc=%d", rc);
         spin_unlock(&q->lock);
+        storage_quota_cancel(STORAGE_QUOTA_WRITE, target_lba_count);
         rc = -EIO;
         goto done_np;
     }
@@ -402,6 +448,9 @@ static int __storage_read(void* dest, size_t siz, uint64_t base_lba, off_t oft)
 
     bool use_thread_cache = req_size <= REQUEST_BUF_SZ;
 
+    int rc = storage_quota_admit(STORAGE_QUOTA_READ, target_lba_count);
+    if (unlikely(rc != 0)) return rc;
+
     struct kthread* k = getk();
     struct storage_q* q = &k->storage_q;
 
@@ -411,20 +460,22 @@ static int __storage_read(void* dest, size_t siz, uint64_t base_lba, off_t oft)
 	else 
         spdk_payload = spdk_zmalloc(req_size, 0, NULL, SPDK_ENV_SOCKET_ID_ANY, SPDK_MALLOC_DMA);
 
-    if (unlikely(spdk_payload == NULL)) 
+    if (unlikely(spdk_payload == NULL))
 	{
 		log_err("__storage_read(): failed to allocate spdk_payload buffer");
+        storage_quota_cancel(STORAGE_QUOTA_READ, target_lba_count);
         putk();
         return -ENOMEM;
     }
 
     spin_lock(&q->lock);
-    int rc = spdk_nvme_ns_cmd_read(spdk_namespace, q->spdk_qp_handle, spdk_payload, target_lba, target_lba_count, seq_complete, thread_self(), 0);
+    rc = spdk_nvme_ns_cmd_read(spdk_namespace, q->spdk_qp_handle, spdk_payload, target_lba, target_lba_count, seq_complete, thread_self(), 0);
 
     if (unlikely(rc != 0)) 
 	{
 		log_err("__storage_read(): spdk_nvme_ns_cmd_read failed with rc=%d", rc);
         spin_unlock(&q->lock);
+        storage_quota_cancel(STORAGE_QUOTA_READ, target_lba_count);
         rc = -EIO;
         goto done_np;
     }
@@ -475,16 +526,19 @@ int storage_read_aligned(void* dest, uint64_t lba, uint32_t lba_count)
 		if (unlikely(rc != 0)) return rc;
 	}
 
+	rc = storage_quota_admit(STORAGE_QUOTA_READ, lba_count);
+	if (unlikely(rc != 0)) return rc;
+
 	struct storage_completion completion = { .thread = thread_self(), .status = -EIO, };
 	struct kthread *k = getk();
 	struct storage_q *q = &k->storage_q;
-
 	spin_lock(&q->lock);
 	rc = spdk_nvme_ns_cmd_read(spdk_namespace, q->spdk_qp_handle, dest, lba, lba_count, seq_status_complete, &completion, 0);
-	if (unlikely(rc != 0)) 
+	if (unlikely(rc != 0))
 	{
 		log_err("storage_read_aligned(): spdk_nvme_ns_cmd_read failed with rc=%d", rc);
 		spin_unlock(&q->lock);
+		storage_quota_cancel(STORAGE_QUOTA_READ, lba_count);
 		putk();
 		return -EIO;
 	}
@@ -512,16 +566,19 @@ int storage_write_user_dma(const void *src, uint64_t lba, uint32_t lba_count)
 		if (unlikely(rc != 0)) return rc;
 	}
 
+	rc = storage_quota_admit(STORAGE_QUOTA_WRITE, lba_count);
+	if (unlikely(rc != 0)) return rc;
+
 	struct storage_completion completion = { .thread = thread_self(), .status = -EIO, };
 	struct kthread *k = getk();
 	struct storage_q *q = &k->storage_q;
-
 	spin_lock(&q->lock);
 	rc = spdk_nvme_ns_cmd_write(spdk_namespace, q->spdk_qp_handle, (void *)src, lba, lba_count, seq_status_complete, &completion, 0);
-	if (unlikely(rc != 0)) 
+	if (unlikely(rc != 0))
 	{
 		log_err("storage_write_user_dma(): spdk_nvme_ns_cmd_write failed with rc=%d", rc);
 		spin_unlock(&q->lock);
+		storage_quota_cancel(STORAGE_QUOTA_WRITE, lba_count);
 		putk();
 		return -EIO;
 	}
@@ -555,6 +612,8 @@ int storage_read_aligned_batch(struct storage_batch_read *reqs, unsigned int nr)
 	struct kthread *k;
 	struct storage_q *q;
 	unsigned int submitted = 0;
+	uint32_t admitted_lbas = 0;
+	uint32_t submitted_lbas = 0;
 	int rc;
 
 	if (!cfg_storage_enabled) return -ENODEV;
@@ -576,7 +635,12 @@ int storage_read_aligned_batch(struct storage_batch_read *reqs, unsigned int nr)
 			rc = storage_register_user_dma(reqs[i].dest, bytes);
 			if (unlikely(rc != 0)) return rc;
 		}
+		if (unlikely(admitted_lbas + reqs[i].lba_count < admitted_lbas)) return -EINVAL;
+		admitted_lbas += reqs[i].lba_count;
 	}
+
+	rc = storage_quota_admit(STORAGE_QUOTA_READ, admitted_lbas);
+	if (unlikely(rc != 0)) return rc;
 
 	completion.thread = thread_self();
 	completion.status = 0;
@@ -593,6 +657,7 @@ int storage_read_aligned_batch(struct storage_batch_read *reqs, unsigned int nr)
 			if (i == 0) 
 			{
 				spin_unlock(&q->lock);
+				storage_quota_cancel(STORAGE_QUOTA_READ, admitted_lbas);
 				putk();
 				return -EIO;
 			}
@@ -601,7 +666,10 @@ int storage_read_aligned_batch(struct storage_batch_read *reqs, unsigned int nr)
 		}
 		q->outstanding_reqs++;
 		submitted++;
+		submitted_lbas += reqs[i].lba_count;
 	}
+	if (unlikely(submitted_lbas < admitted_lbas))
+		storage_quota_cancel(STORAGE_QUOTA_READ, admitted_lbas - submitted_lbas);
 	if (unlikely(submitted == 0)) 
 	{
 		spin_unlock(&q->lock);
@@ -809,6 +877,9 @@ static bool __dma_block_transfer(void* buf, uint64_t lba, bool is_write)   // is
         return false;
     }
 
+    int quota_rc = storage_quota_admit(is_write ? STORAGE_QUOTA_WRITE : STORAGE_QUOTA_READ, 1);
+    if (unlikely(quota_rc != 0)) return false;
+
     struct kthread   *k = getk();
     struct storage_q *q = &k->storage_q;
 
@@ -824,6 +895,7 @@ static bool __dma_block_transfer(void* buf, uint64_t lba, bool is_write)   // is
     {
         log_err("spdk_nvme_ns_cmd_%s failed for lba %lu", is_write ? "write" : "read", lba);
         spin_unlock(&q->lock);
+        storage_quota_cancel(is_write ? STORAGE_QUOTA_WRITE : STORAGE_QUOTA_READ, 1);
         putk(); 
         return false;
     }
@@ -859,6 +931,9 @@ int readObj_sync(void* dest, size_t siz, uint64_t lba, uint32_t lba_count)
 	size_t req_size = lba_count * block_size;
 	bool use_thread_cache = req_size <= REQUEST_BUF_SZ;
 
+	int rc = storage_quota_admit(STORAGE_QUOTA_READ, lba_count);
+	if (unlikely(rc != 0)) return rc;
+
 	struct kthread* k = getk();
 	struct storage_q* q = &k->storage_q;
 
@@ -870,6 +945,7 @@ int readObj_sync(void* dest, size_t siz, uint64_t lba, uint32_t lba_count)
 
 	if (unlikely(spdk_payload == NULL)) 
     {
+		storage_quota_cancel(STORAGE_QUOTA_READ, lba_count);
 		preempt_enable();
 		return -ENOMEM;
 	}
@@ -877,10 +953,11 @@ int readObj_sync(void* dest, size_t siz, uint64_t lba, uint32_t lba_count)
     struct syncio_ctx ctx = { .done = false, .status = 0 };
 
 	spin_lock(&q->lock);
-	int rc = spdk_nvme_ns_cmd_read(spdk_namespace, q->spdk_qp_handle, spdk_payload, lba, lba_count, sync_read_cb, &ctx, 0);
+	rc = spdk_nvme_ns_cmd_read(spdk_namespace, q->spdk_qp_handle, spdk_payload, lba, lba_count, sync_read_cb, &ctx, 0);
     if (unlikely(rc != 0)) 
     {
 		spin_unlock(&q->lock);
+		storage_quota_cancel(STORAGE_QUOTA_READ, lba_count);
 		rc = -EIO;
 		goto done_np;
 	}
@@ -971,21 +1048,21 @@ int read_blocks_from_disk(uint64_t lba_start, uint32_t lba_count, void* blockent
 	ctx.sgl.cur_index = 0;
 	ctx.status = -EIO;
 
+	int rc = storage_quota_admit(STORAGE_QUOTA_READ, lba_count);
+	if (unlikely(rc != 0)) return rc;
+
 	struct kthread   *k = getk();
     struct storage_q *q = &k->storage_q;
-	
 	spin_lock(&q->lock);
-	if (ifQuotaPermit(lba_count * block_size))
-	{	
-		int rc = spdk_nvme_ns_cmd_readv(spdk_namespace, q->spdk_qp_handle, lba_start, lba_count, vectorIO_complete, &ctx, 0, block_reset_sgl, block_next_sge);
-		if (unlikely(rc != 0)) 
-		{
-        	spin_unlock(&q->lock);
-        	putk();
-        	return -1;
-    	}
-		q->outstanding_reqs++;
+	rc = spdk_nvme_ns_cmd_readv(spdk_namespace, q->spdk_qp_handle, lba_start, lba_count, vectorIO_complete, &ctx, 0, block_reset_sgl, block_next_sge);
+	if (unlikely(rc != 0))
+	{
+		spin_unlock(&q->lock);
+		storage_quota_cancel(STORAGE_QUOTA_READ, lba_count);
+		putk();
+		return -1;
 	}
+	q->outstanding_reqs++;
 	thread_park_and_unlock_np(&q->lock);
 	preempt_disable();
 
@@ -1005,17 +1082,21 @@ int write_blocks_to_disk(uint64_t lba_start, uint32_t lba_count, void* blockentr
     ctx.sgl.blockentries = blockentries;
     ctx.sgl.num_blocks = lba_count;
     ctx.sgl.block_size = block_size;
-    ctx.sgl.cur_index = 0;
+	ctx.sgl.cur_index = 0;
 	ctx.status = -EIO;
+
+	int rc = storage_quota_admit(STORAGE_QUOTA_WRITE, lba_count);
+	if (unlikely(rc != 0)) return rc;
 
     struct kthread *k = getk();
     struct storage_q *q = &k->storage_q;
     spin_lock(&q->lock);
 
-    int rc = spdk_nvme_ns_cmd_writev(spdk_namespace, q->spdk_qp_handle, lba_start, lba_count, vectorIO_complete, &ctx, 0, block_reset_sgl, block_next_sge);
+    rc = spdk_nvme_ns_cmd_writev(spdk_namespace, q->spdk_qp_handle, lba_start, lba_count, vectorIO_complete, &ctx, 0, block_reset_sgl, block_next_sge);
     if (unlikely(rc != 0)) 
     {
         spin_unlock(&q->lock);
+		storage_quota_cancel(STORAGE_QUOTA_WRITE, lba_count);
         putk();
         return -1;
     }
