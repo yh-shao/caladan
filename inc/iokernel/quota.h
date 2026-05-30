@@ -34,11 +34,17 @@
 
 #define QUOTA_DEFAULT_REFILL_US ((uint64_t)(REFILL_TIME * TO_US))
 
+enum storage_quota_mode {
+    STORAGE_QUOTA_MODE_ELASTIC = 0,
+    STORAGE_QUOTA_MODE_HARD_CAP = 1,
+};
+
 typedef struct {
     volatile int64_t bucket;    // runtime 从该共享桶批量领取本地 token，避免每次 IO 原子扣减
     volatile int64_t quota;     // 当前分配配额
     volatile uint64_t epoch;    // iokernel 每次重新分配配额时递增，runtime 据此刷新本地 token
     volatile int64_t demand;    // 周期内申请使用量
+    volatile int64_t last_demand; // iokernel 上一次 refill 观察到的需求
     
     /* Admin 专用字段 (仅 Admin 进程读写) */
     double ewma;                // 历史加权平均需求
@@ -49,9 +55,12 @@ typedef struct {
 typedef struct {
     int         priority;  // TODO：删掉
     atomic64_t   enabled;  // runtime 控制开关；为 0 时 iokernel 不做 quota refill
+    atomic64_t   mode;     // enum storage_quota_mode；elastic 或 hard-cap
     spinlock_t   lock;     // 保护 iokernel refill 与 runtime 批量取 token 的共享桶状态
     QuotaDim    iops;
     QuotaDim    bytes;
+    int64_t     iops_cap;  // hard-cap 模式下每个 refill epoch 的 IOPS 上限
+    int64_t     bytes_cap; // hard-cap 模式下每个 refill epoch 的 bytes 上限
     atomic64_t   wake_epoch; // iokernel 通知 runtime 有新的 quota epoch，可重新检查 quota waiters
 } QuotaInfo;
 // static int iops_offset  = offsetof(QuotaInfo, iops);

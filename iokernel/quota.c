@@ -36,10 +36,12 @@ double calc_target(int type, QuotaInfo* Quota)  // 计算 task 在下一周期�
 {
     QuotaDim* q         = (type == 0) ? &Quota->iops         : &Quota->bytes;
     double MaxAvailable = (type == 0) ? TOTAL_IOPS_ALLOCABLE : TOTAL_BW_ALLOCABLE;
+    int64_t demand;
 
     if (q->init == 0) 
     {
-        int64_t demand = __atomic_exchange_n(&q->demand, 0, __ATOMIC_SEQ_CST);
+        demand = __atomic_exchange_n(&q->demand, 0, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&q->last_demand, demand, __ATOMIC_RELAXED);
         q->ewma = demand > 0 ? demand : MaxAvailable * DEFAULT_RATIO;
         q->target = MAX(q->ewma, MaxAvailable * DEFAULT_RATIO);
         q->init = 1;
@@ -47,7 +49,8 @@ double calc_target(int type, QuotaInfo* Quota)  // 计算 task 在下一周期�
     else
     {
         int64_t oldQuota = __atomic_load_n(&q->quota, __ATOMIC_RELAXED);        // 上轮分配的 quota 值
-        int64_t demand = __atomic_exchange_n(&q->demand, 0, __ATOMIC_SEQ_CST);  // 原子读取并清零
+        demand = __atomic_exchange_n(&q->demand, 0, __ATOMIC_SEQ_CST);  // 原子读取并清零
+        __atomic_store_n(&q->last_demand, demand, __ATOMIC_RELAXED);
         q->ewma = (1.0 - ALPHA) * demand + ALPHA * q->ewma;                     // EWMA 更新
         if (oldQuota <= 0) 
             q->target = MAX(q->ewma, MaxAvailable * DEFAULT_RATIO); // 或者 MAX(ewma, 1)
@@ -67,6 +70,17 @@ static void quota_assign_dim(QuotaDim* q, int64_t assign)
     __atomic_store_n(&q->bucket, assign, __ATOMIC_RELEASE);
     __atomic_store_n(&q->quota, assign, __ATOMIC_RELEASE);
     __atomic_add_fetch(&q->epoch, 1, __ATOMIC_RELEASE);
+}
+
+static inline int64_t quota_apply_cap(QuotaInfo* Quota, int type, int64_t assign)
+{
+    if (atomic64_read(&Quota->mode) != STORAGE_QUOTA_MODE_HARD_CAP) return assign;
+
+    QuotaDim* q = type == 0 ? &Quota->iops : &Quota->bytes;
+    int64_t cap = type == 0 ? Quota->iops_cap : Quota->bytes_cap;
+    if (cap < 1) cap = 1;
+    if (__atomic_load_n(&q->last_demand, __ATOMIC_RELAXED) > 0) return cap;
+    return MIN(assign, cap);
 }
 
 void refillQuota(void)
@@ -133,8 +147,9 @@ void refillQuota(void)
             else                            assign_op = (D_L_op > 0) ? ceil((Quota->iops.target / D_L_op) * Q_L_op) : 0;
         }
         spin_lock(&Quota->lock);
-        quota_assign_dim(&Quota->iops, (int64_t)assign_op);
-        final_sum_op += assign_op;
+        int64_t capped_assign_op = quota_apply_cap(Quota, 0, (int64_t)assign_op);
+        quota_assign_dim(&Quota->iops, capped_assign_op);
+        final_sum_op += capped_assign_op;
 
         double assign_bw = 0;
         if (L_bw <= 1.0) assign_bw = ceil(Quota->bytes.target);
@@ -143,9 +158,10 @@ void refillQuota(void)
             if (p->sched_cfg.priority == SCHED_PRIO_LC) assign_bw = (D_H_bw > 0) ? ceil((Quota->bytes.target / D_H_bw) * Q_H_bw) : 0;
             else                            assign_bw = (D_L_bw > 0) ? ceil((Quota->bytes.target / D_L_bw) * Q_L_bw) : 0;
         }
-        quota_assign_dim(&Quota->bytes, (int64_t)assign_bw);
+        int64_t capped_assign_bw = quota_apply_cap(Quota, 1, (int64_t)assign_bw);
+        quota_assign_dim(&Quota->bytes, capped_assign_bw);
         spin_unlock(&Quota->lock);
-        final_sum_bw += assign_bw;
+        final_sum_bw += capped_assign_bw;
 
         atomic64_fetch_and_add(&Quota->wake_epoch, 1);
     }

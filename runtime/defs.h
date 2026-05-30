@@ -487,6 +487,7 @@ extern unsigned int maxks;
 extern unsigned int guaranteedks;
 extern bool cfg_prio_is_lc;
 extern bool cfg_storage_quota_enabled;
+extern uint64_t cfg_storage_quota_mode;
 extern bool cfg_storage_quota_borrow_global_enabled;
 extern uint64_t cfg_storage_quota_refill_us;
 extern uint64_t cfg_storage_quota_iops;

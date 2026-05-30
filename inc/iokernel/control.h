@@ -20,7 +20,7 @@
  * struct control_hdr, please increment the version number!
  */
 
-#define CONTROL_HDR_VERSION 15  // runtime_info 中的 QuotaInfo 布局已变更
+#define CONTROL_HDR_VERSION 17  // runtime_info 中的 QuotaInfo 布局已变更
 
 /* The abstract namespace path for the control socket. */
 #define CONTROL_SOCK_PATH	"/run/iokernel.sock"

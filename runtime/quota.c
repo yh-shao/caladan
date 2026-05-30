@@ -5,6 +5,7 @@
 #include "defs.h"
 
 bool cfg_storage_quota_enabled;
+uint64_t cfg_storage_quota_mode = STORAGE_QUOTA_MODE_ELASTIC;
 bool cfg_storage_quota_borrow_global_enabled = true;
 uint64_t cfg_storage_quota_refill_us = QUOTA_DEFAULT_REFILL_US;
 uint64_t cfg_storage_quota_iops = HARDWARE_IOPS;
@@ -12,6 +13,7 @@ uint64_t cfg_storage_quota_bytes = HARDWARE_BW;
 
 #define QUOTA_BORROW_MIN_IOPS  1024
 #define QUOTA_BORROW_MIN_BYTES (4ULL * 1024 * 1024)
+#define QUOTA_WAIT_POLL_US     1000
 
 struct quota_bucket {
     int64_t tokens;
@@ -29,6 +31,20 @@ struct storage_quota_local {
 static DEFINE_PERTHREAD(struct storage_quota_local, storage_quota_local);
 
 static inline int64_t quota_max_i64(int64_t a, int64_t b) { return a > b ? a : b; }
+
+static inline int64_t quota_rate_to_epoch(uint64_t rate)
+{
+    uint64_t whole = rate / TO_US;
+    uint64_t rem = rate % TO_US;
+    uint64_t quota;
+
+    if (whole > (uint64_t)INT64_MAX / QUOTA_DEFAULT_REFILL_US) return INT64_MAX;
+    quota = whole * QUOTA_DEFAULT_REFILL_US;
+    quota += (rem * QUOTA_DEFAULT_REFILL_US + TO_US - 1) / TO_US;
+    if (quota == 0) quota = 1;
+    if (quota > (uint64_t)INT64_MAX) return INT64_MAX;
+    return (int64_t)quota;
+}
 
 static inline bool quota_runtime_ready(void)
 {
@@ -77,13 +93,14 @@ void storage_quota_init_runtime(void)
     memset(q, 0, sizeof(*q));
     spin_lock_init(&q->lock);
     atomic64_write(&q->enabled, cfg_storage_quota_enabled ? 1 : 0);
+    atomic64_write(&q->mode, cfg_storage_quota_mode);
 
     if (!cfg_storage_quota_enabled) return;
 
-    int64_t iops_quota = (int64_t)((cfg_storage_quota_iops * QUOTA_DEFAULT_REFILL_US + TO_US - 1) / TO_US);
-    int64_t bytes_quota = (int64_t)((cfg_storage_quota_bytes * QUOTA_DEFAULT_REFILL_US + TO_US - 1) / TO_US);
-    if (iops_quota <= 0) iops_quota = 1;
-    if (bytes_quota <= 0) bytes_quota = 1;
+    int64_t iops_quota = quota_rate_to_epoch(cfg_storage_quota_iops);
+    int64_t bytes_quota = quota_rate_to_epoch(cfg_storage_quota_bytes);
+    q->iops_cap = iops_quota;
+    q->bytes_cap = bytes_quota;
 
     __atomic_store_n(&q->iops.bucket, iops_quota, __ATOMIC_RELEASE);
     __atomic_store_n(&q->bytes.bucket, bytes_quota, __ATOMIC_RELEASE);
@@ -195,6 +212,7 @@ static bool quota_try_pull_shared(uint32_t iops, uint64_t bytes)
 
 static bool quota_try_borrow_global(uint32_t iops, uint64_t bytes)
 {
+    if (cfg_storage_quota_mode == STORAGE_QUOTA_MODE_HARD_CAP) return false;
     if (!cfg_storage_quota_borrow_global_enabled) return false;
     if (!iok.iok_info) return false;
 
@@ -304,6 +322,7 @@ int storage_quota_wait(uint32_t iops, uint64_t bytes)
     if (unlikely(bytes > (uint64_t)INT64_MAX)) return -EOVERFLOW;
     storage_quota_account(iops, bytes);
     uint64_t sleep_us = cfg_storage_quota_refill_us ? cfg_storage_quota_refill_us : QUOTA_DEFAULT_REFILL_US;
+    uint64_t observed_wake_epoch = atomic64_read(&runtime_info->Q.wake_epoch);
 
     for (;;)
     {
@@ -312,7 +331,14 @@ int storage_quota_wait(uint32_t iops, uint64_t bytes)
         preempt_enable();
         if (ok) return 0;
 
-        timer_sleep(sleep_us);
+        uint64_t wake_epoch = atomic64_read(&runtime_info->Q.wake_epoch);
+        if (wake_epoch != observed_wake_epoch)
+        {
+            observed_wake_epoch = wake_epoch;
+            continue;
+        }
+
+        timer_sleep(sleep_us > QUOTA_WAIT_POLL_US ? QUOTA_WAIT_POLL_US : sleep_us);
     }
 }
 

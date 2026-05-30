@@ -249,6 +249,25 @@ static int parse_storage_quota_enabled(const char *name, const char *val)
 	return 0;
 }
 
+static int parse_storage_quota_mode(const char *name, const char *val)
+{
+	if (!strcmp(val, "elastic") || !strcmp(val, "work_conserving") || !strcmp(val, "work-conserving"))
+	{
+		cfg_storage_quota_mode = STORAGE_QUOTA_MODE_ELASTIC;
+	}
+	else if (!strcmp(val, "hard_cap") || !strcmp(val, "hard-cap") || !strcmp(val, "hardcap"))
+	{
+		cfg_storage_quota_mode = STORAGE_QUOTA_MODE_HARD_CAP;
+	}
+	else 
+	{
+		log_err("%s must be elastic or hard_cap", name);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int parse_storage_quota_u64(const char *name, const char *val)
 {
 	long tmp;
@@ -431,6 +450,7 @@ static const struct cfg_handler cfg_handlers[] = {
 	{ "runtime_quantum_us", parse_runtime_quantum_us, false },
 	{ "quota_enabled", parse_storage_quota_enabled, false },
 	{ "storage_quota_enabled", parse_storage_quota_enabled, false },
+	{ "storage_quota_mode", parse_storage_quota_mode, false },
 	{ "storage_quota_borrow_global", parse_storage_quota_enabled, false },
 	{ "storage_quota_refill_us", parse_storage_quota_u64, false },
 	{ "storage_quota_iops", parse_storage_quota_u64, false },
@@ -576,11 +596,8 @@ int cfg_load(const char *path)
 #endif
 		 cfg_directpath_enabled() ? "enabled" : "disabled",
 		 cfg_transparent_hugepages_enabled ? "enabled" : "disabled");
-	log_info("cfg: storage quota %s (borrow_global=%s, refill_us=%lu, iops=%lu, bytes=%lu)",
-		 cfg_storage_quota_enabled ? "enabled" : "disabled",
-		 cfg_storage_quota_borrow_global_enabled ? "enabled" : "disabled",
-		 cfg_storage_quota_refill_us, cfg_storage_quota_iops,
-		 cfg_storage_quota_bytes);
+	bool storage_quota_borrow_effective = cfg_storage_quota_mode != STORAGE_QUOTA_MODE_HARD_CAP && cfg_storage_quota_borrow_global_enabled;
+	log_info("cfg: storage quota %s (mode=%s, borrow_global=%s, refill_us=%lu, iops=%lu, bytes=%lu)", cfg_storage_quota_enabled ? "enabled" : "disabled", cfg_storage_quota_mode == STORAGE_QUOTA_MODE_HARD_CAP ? "hard_cap" : "elastic", storage_quota_borrow_effective ? "enabled" : "disabled", cfg_storage_quota_refill_us, cfg_storage_quota_iops, cfg_storage_quota_bytes);
 
 out:
 	fclose(f);
