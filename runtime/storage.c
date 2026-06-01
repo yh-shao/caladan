@@ -54,11 +54,15 @@ static DEFINE_SPINLOCK(user_dma_register_lock);    // 保护 spdk_mem_register �
 struct nvme_device {
 	const char *name;
 	unsigned long latency_us;
-} known_devices[1] = {
+} known_devices[] = {
 	{
 		.name = "INTEL SSDPED1D280GA",
 		.latency_us = 10,
-	}
+	},
+	{
+		.name = "SAMSUNG MZQL2960HCJR",
+		.latency_us = 10,
+	},
 };
 
 static size_t user_dma_cache_slot(uintptr_t page_base)
@@ -236,6 +240,63 @@ static void seq_status_complete(void *arg, const struct spdk_nvme_cpl *completio
 		thread_ready_head(ctx->thread);
 	else
 		thread_ready(ctx->thread);
+}
+
+static void storage_async_complete(void *arg, const struct spdk_nvme_cpl *completion)
+{
+	struct storage_async_req *req = arg;
+	int status = spdk_nvme_cpl_is_error(completion) ? -EIO : 0;
+	req->cb(req, req->cb_arg, status);   // 调用 callback
+}
+
+static int storage_async_submit(struct storage_async_req *req, bool write)
+{
+	struct kthread *k;
+	struct storage_q *q;
+	int rc;
+
+	if (!cfg_storage_enabled) return -ENODEV;
+	if (unlikely(req == NULL || req->buf == NULL || req->cb == NULL)) return -EINVAL;
+	if (unlikely(req->lba_count == 0 || block_size == 0)) return -EINVAL;
+	if (unlikely(((uintptr_t)req->buf & (block_size - 1)) != 0)) return -EINVAL;
+
+	k = getk();
+	q = &k->storage_q;
+
+	spin_lock(&q->lock);
+	if (write)
+		rc = spdk_nvme_ns_cmd_write(spdk_namespace, q->spdk_qp_handle, req->buf, req->lba, req->lba_count, storage_async_complete, req, 0);
+	else
+		rc = spdk_nvme_ns_cmd_read(spdk_namespace, q->spdk_qp_handle, req->buf, req->lba, req->lba_count, storage_async_complete, req, 0);
+
+	if (unlikely(rc != 0))
+	{
+		spin_unlock(&q->lock);
+		putk();
+		return -EIO;
+	}
+	q->outstanding_reqs++;
+	spin_unlock(&q->lock);
+	putk();
+	return 0;
+}
+
+int storage_async_read(struct storage_async_req *req)  { return storage_async_submit(req, false); }
+int storage_async_write(struct storage_async_req *req) { return storage_async_submit(req, true);  }
+
+int storage_async_poll(uint32_t max_completions)
+{
+	if (!cfg_storage_enabled) return -ENODEV;
+
+	struct kthread *k = getk();
+	struct storage_q *q = &k->storage_q;
+
+	spin_lock(&q->lock);
+	int ret = spdk_nvme_qpair_process_completions(q->spdk_qp_handle, max_completions);
+	q->outstanding_reqs -= ret;
+	spin_unlock(&q->lock);
+	putk();
+	return ret;
 }
 
 static bool probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid, struct spdk_nvme_ctrlr_opts *opts)
