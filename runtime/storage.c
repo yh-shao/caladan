@@ -293,7 +293,7 @@ int storage_async_poll(uint32_t max_completions)
 
 	spin_lock(&q->lock);
 	int ret = spdk_nvme_qpair_process_completions(q->spdk_qp_handle, max_completions);
-	q->outstanding_reqs -= ret;
+	if (ret > 0) q->outstanding_reqs -= ret;
 	spin_unlock(&q->lock);
 	putk();
 	return ret;
@@ -749,7 +749,7 @@ static int storage_softirq_one(struct storage_q *q)
 	assert_spin_lock_held(&q->lock);
 
 	ret = spdk_nvme_qpair_process_completions(q->spdk_qp_handle, RUNTIME_RX_BATCH_SIZE);
-	q->outstanding_reqs -= ret;
+	if (ret > 0) q->outstanding_reqs -= ret;
 	return ret;
 }
 
