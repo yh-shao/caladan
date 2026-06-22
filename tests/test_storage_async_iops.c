@@ -17,6 +17,7 @@
 #include <runtime/thread.h>
 #include <runtime/timer.h>
 #include <spdk/env.h>
+#include <spdk/util.h>
 
 #define DEFAULT_POLLERS		1
 #define DEFAULT_QD		64
@@ -30,6 +31,7 @@ struct bench_cfg {
 	unsigned int seconds;
 	bool write;
 	bool random;
+	bool callback_submit;
 	uint64_t range_mb;
 	uint64_t base_lba;
 	uint32_t request_bytes;
@@ -68,27 +70,12 @@ static struct bench_cfg cfg = {
 	.seconds = DEFAULT_SECONDS,
 	.write = false,
 	.random = true,
+	.callback_submit = false,
 	.range_mb = 0,
 	.base_lba = 0,
 	.request_bytes = DEFAULT_REQUEST_BYTES,
 	.poll_batch = DEFAULT_POLL_BATCH,
 };
-
-static uint64_t splitmix64_next(uint64_t *state)
-{
-	uint64_t z;
-
-	*state += 0x9e3779b97f4a7c15UL;
-	z = *state;
-	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9UL;
-	z = (z ^ (z >> 27)) * 0x94d049bb133111ebUL;
-	return z ^ (z >> 31);
-}
-
-static uint64_t rand_below(uint64_t rnd, uint64_t range)
-{
-	return (uint64_t)(((__uint128_t)rnd * range) >> 64);
-}
 
 static int parse_u64(const char *s, uint64_t *out)
 {
@@ -103,14 +90,30 @@ static int parse_u64(const char *s, uint64_t *out)
 	return 0;
 }
 
+static void *zalloc_cache_aligned(size_t size)
+{
+	void *ptr;
+
+	if (posix_memalign(&ptr, CACHE_LINE_SIZE, size) != 0)
+		return NULL;
+	memset(ptr, 0, size);
+	return ptr;
+}
+
 static uint64_t next_lba(struct poller_arg *p)
 {
 	uint64_t unit;
 
-	if (cfg.random)
-		unit = rand_below(splitmix64_next(&p->rnd), p->max_units);
-	else
+	if (cfg.random) {
+		uint64_t rnd = spdk_rand_xorshift64(&p->rnd);
+
+		if (is_power_of_two(p->max_units))
+			unit = rnd & (p->max_units - 1);
+		else
+			unit = rnd % p->max_units;
+	} else {
 		unit = p->next_seq++ % p->max_units;
+	}
 	return p->base_lba + unit * p->lba_count;
 }
 
@@ -128,6 +131,38 @@ static void complete_slot(struct storage_async_req *req, void *arg, int status)
 {
 	struct io_slot *slot = arg;
 	struct poller_arg *p = slot->poller;
+	int ret;
+
+	if (cfg.callback_submit) {
+		if (unlikely(status != 0)) {
+			p->errors++;
+			p->stop_submit = true;
+			p->inflight--;
+			return;
+		}
+
+		p->completed++;
+
+		if ((p->completed & 0xffUL) == 0 &&
+		    microtime() >= p->deadline_us)
+			p->stop_submit = true;
+
+		if (p->stop_submit) {
+			p->inflight--;
+			return;
+		}
+
+		ret = submit_slot(slot);
+		if (unlikely(ret != 0)) {
+			log_err("poller %u callback resubmit failed: ret=%d",
+				p->id, ret);
+			p->errors++;
+			p->stop_submit = true;
+			p->inflight--;
+		}
+		return;
+	}
+
 	uint32_t tail = p->cq_tail++;
 
 	slot->status = status;
@@ -205,6 +240,9 @@ static void poller_handler(void *arg)
 		if (ret == 0)
 			cpu_relax();
 
+		if (cfg.callback_submit)
+			continue;
+
 		while (p->cq_head != p->cq_tail) {
 			struct io_slot *slot = p->cq[p->cq_head & (cfg.qd - 1)];
 
@@ -237,8 +275,10 @@ static void poller_handler(void *arg)
 		}
 	}
 
-	p->completed = completed;
-	p->errors = errors;
+	if (!cfg.callback_submit) {
+		p->completed = completed;
+		p->errors = errors;
+	}
 	log_info("poller[%u] kthread=%u completed=%ld errors=%ld",
 		 p->id, get_current_affinity(), p->completed, p->errors);
 	free(p->cq);
@@ -287,17 +327,18 @@ static void main_handler(void *arg)
 	effective_range_mb = max_units * (uint64_t)cfg.request_bytes /
 			     (1024UL * 1024UL);
 
-	log_info("async config: pollers=%u qd=%u seconds=%u op=%s pattern=%s range_mb=%lu effective_range_mb=%lu request_bytes=%u poll_batch=%u",
+	log_info("async config: pollers=%u qd=%u seconds=%u op=%s pattern=%s range_mb=%lu effective_range_mb=%lu request_bytes=%u poll_batch=%u completion_mode=%s",
 		 cfg.pollers, cfg.qd, cfg.seconds, cfg.write ? "write" : "read",
 		 cfg.random ? "rand" : "seq", cfg.range_mb, effective_range_mb,
-		 cfg.request_bytes, cfg.poll_batch);
+		 cfg.request_bytes, cfg.poll_batch,
+		 cfg.callback_submit ? "callback-submit" : "deferred-submit");
 	log_info("device: sector_size=%u num_lbas=%lu base_lba=%lu lba_count=%u random_units=%lu runtime_max_cores=%d active_cores=%d",
 		 sector_size, num_lbas, cfg.base_lba, lba_count, max_units,
 		 runtime_max_cores(), runtime_active_cores());
 	if (cfg.random && effective_range_mb < 524288)
 		log_warn("random range is below 512GiB; PM9A3 randread IOPS may be underestimated");
 
-	pollers = calloc(cfg.pollers, sizeof(*pollers));
+	pollers = zalloc_cache_aligned(cfg.pollers * sizeof(*pollers));
 	BUG_ON(!pollers);
 
 	waitgroup_init(&wg);
@@ -340,10 +381,11 @@ static void main_handler(void *arg)
 
 static void usage(const char *prog)
 {
-	printf("usage: %s <config> [pollers] [qd] [seconds] [op] [pattern] [range_mb] [base_lba] [request_bytes] [poll_batch]\n", prog);
+	printf("usage: %s <config> [pollers] [qd] [seconds] [op] [pattern] [range_mb] [base_lba] [request_bytes] [poll_batch] [completion_mode]\n", prog);
 	printf("  op:      read or write (default: read)\n");
 	printf("  pattern: rand or seq (default: rand)\n");
 	printf("  range_mb: 0 means whole namespace after base_lba (default: 0)\n");
+	printf("  completion_mode: deferred or callback (default: deferred)\n");
 }
 
 int main(int argc, char *argv[])
@@ -351,7 +393,7 @@ int main(int argc, char *argv[])
 	uint64_t val;
 	int ret;
 
-	if (argc < 2 || argc > 11) {
+	if (argc < 2 || argc > 12) {
 		usage(argv[0]);
 		return -EINVAL;
 	}
@@ -413,6 +455,15 @@ int main(int argc, char *argv[])
 		if (ret || val > 4096)
 			return -EINVAL;
 		cfg.poll_batch = val;
+	}
+	if (argc > 11) {
+		if (!strcmp(argv[11], "deferred")) {
+			cfg.callback_submit = false;
+		} else if (!strcmp(argv[11], "callback")) {
+			cfg.callback_submit = true;
+		} else {
+			return -EINVAL;
+		}
 	}
 
 	ret = runtime_init(argv[1], main_handler, NULL);

@@ -16,6 +16,7 @@ uint64_t num_blocks;
 #include <base/mempool.h>
 #include <base/syscall.h>
 #include <runtime/sync.h>
+#include <runtime/shaofs_timing.h>
 
 // Hack to prevent SPDK from pulling in extra headers here
 #define SPDK_STDINC_H
@@ -143,13 +144,17 @@ static int storage_register_user_dma(void *buf, size_t len)
 	uintptr_t reg_base, reg_end;
 	int rc;
 
+	shaofs_tbd_set_dma_register(true);
+	shaofs_tbd_event(SHAOFS_TBD_STORAGE_DMA_REGISTER_BEGIN);
 	if (unlikely(!user_dma_registration_range(buf, len, &reg_base, &reg_end))) return -EINVAL;
 
 	spin_lock_np(&user_dma_lock);
 	if (user_dma_cache_lookup(reg_base, reg_end))    // 查本地 2MB 页粒度 cache：user_dma_pages[]，避免重复注册；如果 cache 没命中，再进行后续的 mlock + spdk_mem_register
 	{
 		spin_unlock_np(&user_dma_lock);
-		return user_dma_range_vtophys_ok(buf, len) ? 0 : -EFAULT;
+		rc = user_dma_range_vtophys_ok(buf, len) ? 0 : -EFAULT;
+		shaofs_tbd_event(SHAOFS_TBD_STORAGE_DMA_REGISTER_END);
+		return rc;
 	}
 	spin_unlock_np(&user_dma_lock);
 
@@ -207,6 +212,7 @@ static int storage_register_user_dma(void *buf, size_t len)
 		user_dma_registered_logged = true;
 		log_info("storage: enabled direct DMA into user buffers");
 	}
+	shaofs_tbd_event(SHAOFS_TBD_STORAGE_DMA_REGISTER_END);
 	return 0;
 }
 
@@ -233,13 +239,17 @@ static void seq_status_complete(void *arg, const struct spdk_nvme_cpl *completio
 {
 	struct storage_completion *ctx = arg;
 
+	shaofs_tbd_event(SHAOFS_TBD_COMPLETION_CB_ENTER);
 	ctx->status = spdk_nvme_cpl_is_error(completion) ? -EIO : 0;
+	shaofs_tbd_set_storage_status(ctx->status);
 	barrier();
 
+	shaofs_tbd_event(SHAOFS_TBD_READY_BEGIN);
 	if (runtime_info && atomic64_read(&runtime_info->spdk_uipi))
 		thread_ready_head(ctx->thread);
 	else
 		thread_ready(ctx->thread);
+	shaofs_tbd_event(SHAOFS_TBD_READY_END);
 }
 
 static void storage_async_complete(void *arg, const struct spdk_nvme_cpl *completion)
@@ -571,6 +581,8 @@ int storage_read_obj(void* obj, size_t siz, uint64_t lba_start, off_t oft)   // 
 
 int storage_read_aligned(void* dest, uint64_t lba, uint32_t lba_count)
 {
+	shaofs_tbd_event(SHAOFS_TBD_STORAGE_ENTER);
+	shaofs_tbd_set_lba(lba, lba_count);
 	if (!cfg_storage_enabled) return -ENODEV;
 	if (unlikely(lba_count == 0)) return 0;
 	if (unlikely(dest == NULL || block_size == 0)) return -EINVAL;
@@ -581,19 +593,28 @@ int storage_read_aligned(void* dest, uint64_t lba, uint32_t lba_count)
 	size_t bytes = (size_t)lba_count * block_size;
 	if (unlikely(bytes / block_size != lba_count)) return -EINVAL;
 
+	shaofs_tbd_event(SHAOFS_TBD_STORAGE_DMA_CHECK_BEGIN);
 	if (unlikely(!user_dma_range_vtophys_ok(dest, bytes))) 
 	{
+		shaofs_tbd_event(SHAOFS_TBD_STORAGE_DMA_CHECK_END);
 		rc = storage_register_user_dma(dest, bytes);
 		if (unlikely(rc != 0)) return rc;
 	}
+	else
+	{
+		shaofs_tbd_event(SHAOFS_TBD_STORAGE_DMA_CHECK_END);
+	}
 
+	shaofs_tbd_event(SHAOFS_TBD_STORAGE_QUOTA_BEGIN);
 	rc = storage_quota_admit(STORAGE_QUOTA_READ, lba_count);
 	if (unlikely(rc != 0)) return rc;
+	shaofs_tbd_event(SHAOFS_TBD_STORAGE_QUOTA_END);
 
 	struct storage_completion completion = { .thread = thread_self(), .status = -EIO, };
 	struct kthread *k = getk();
 	struct storage_q *q = &k->storage_q;
 	spin_lock(&q->lock);
+	shaofs_tbd_event(SHAOFS_TBD_STORAGE_SUBMIT_BEGIN);
 	rc = spdk_nvme_ns_cmd_read(spdk_namespace, q->spdk_qp_handle, dest, lba, lba_count, seq_status_complete, &completion, 0);
 	if (unlikely(rc != 0))
 	{
@@ -603,14 +624,20 @@ int storage_read_aligned(void* dest, uint64_t lba, uint32_t lba_count)
 		putk();
 		return -EIO;
 	}
+	shaofs_tbd_event(SHAOFS_TBD_STORAGE_SUBMIT_END);
 
 	q->outstanding_reqs++;
+	shaofs_tbd_event(SHAOFS_TBD_PARK_BEGIN);
 	thread_park_and_unlock_np(&q->lock);
+	shaofs_tbd_event(SHAOFS_TBD_RESUME_AFTER_PARK);
+	shaofs_tbd_event(SHAOFS_TBD_STORAGE_RETURN);
 	return completion.status;
 }
 
 int storage_write_user_dma(const void *src, uint64_t lba, uint32_t lba_count)
 {
+	shaofs_tbd_event(SHAOFS_TBD_STORAGE_ENTER);
+	shaofs_tbd_set_lba(lba, lba_count);
 	if (!cfg_storage_enabled) return -ENODEV;
 	if (unlikely(lba_count == 0)) return 0;
 	if (unlikely(src == NULL || block_size == 0)) return -EINVAL;
@@ -621,19 +648,28 @@ int storage_write_user_dma(const void *src, uint64_t lba, uint32_t lba_count)
 	size_t bytes = (size_t)lba_count * block_size;
 	if (unlikely(bytes / block_size != lba_count)) return -EINVAL;
 
+	shaofs_tbd_event(SHAOFS_TBD_STORAGE_DMA_CHECK_BEGIN);
 	if (unlikely(!user_dma_range_vtophys_ok((void *)src, bytes))) 
 	{
+		shaofs_tbd_event(SHAOFS_TBD_STORAGE_DMA_CHECK_END);
 		rc = storage_register_user_dma((void *)src, bytes);
 		if (unlikely(rc != 0)) return rc;
 	}
+	else
+	{
+		shaofs_tbd_event(SHAOFS_TBD_STORAGE_DMA_CHECK_END);
+	}
 
+	shaofs_tbd_event(SHAOFS_TBD_STORAGE_QUOTA_BEGIN);
 	rc = storage_quota_admit(STORAGE_QUOTA_WRITE, lba_count);
 	if (unlikely(rc != 0)) return rc;
+	shaofs_tbd_event(SHAOFS_TBD_STORAGE_QUOTA_END);
 
 	struct storage_completion completion = { .thread = thread_self(), .status = -EIO, };
 	struct kthread *k = getk();
 	struct storage_q *q = &k->storage_q;
 	spin_lock(&q->lock);
+	shaofs_tbd_event(SHAOFS_TBD_STORAGE_SUBMIT_BEGIN);
 	rc = spdk_nvme_ns_cmd_write(spdk_namespace, q->spdk_qp_handle, (void *)src, lba, lba_count, seq_status_complete, &completion, 0);
 	if (unlikely(rc != 0))
 	{
@@ -643,9 +679,13 @@ int storage_write_user_dma(const void *src, uint64_t lba, uint32_t lba_count)
 		putk();
 		return -EIO;
 	}
+	shaofs_tbd_event(SHAOFS_TBD_STORAGE_SUBMIT_END);
 
 	q->outstanding_reqs++;
+	shaofs_tbd_event(SHAOFS_TBD_PARK_BEGIN);
 	thread_park_and_unlock_np(&q->lock);
+	shaofs_tbd_event(SHAOFS_TBD_RESUME_AFTER_PARK);
+	shaofs_tbd_event(SHAOFS_TBD_STORAGE_RETURN);
 	return completion.status;
 }
 
@@ -748,8 +788,10 @@ static int storage_softirq_one(struct storage_q *q)
 
 	assert_spin_lock_held(&q->lock);
 
+	shaofs_tbd_event(SHAOFS_TBD_SOFTIRQ_PROCESS_BEGIN);
 	ret = spdk_nvme_qpair_process_completions(q->spdk_qp_handle, RUNTIME_RX_BATCH_SIZE);
 	if (ret > 0) q->outstanding_reqs -= ret;
+	shaofs_tbd_set_softirq_completions(ret);
 	return ret;
 }
 

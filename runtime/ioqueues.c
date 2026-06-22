@@ -3,6 +3,7 @@
  */
 
 #include <fcntl.h>
+#include <linux/memfd.h>
 #include <pthread.h>
 #include <string.h>
 #include <sys/ipc.h>
@@ -236,7 +237,9 @@ int ioqueues_init(void)
 	int i, flags = 0;
 	struct thread_spec *ts;
 
-	if (shm_page_size() > PGSIZE_4KB)
+	if (shm_page_size() == PGSIZE_2MB)
+		flags |= MFD_HUGETLB | MFD_HUGE_2MB;
+	else if (shm_page_size() > PGSIZE_4KB)
 		flags |= MFD_HUGETLB;
 
 #ifdef MFD_EXEC

@@ -17,6 +17,7 @@
 #include <runtime/sync.h>
 #include <runtime/thread.h>
 #include <runtime/interruptible_wait.h>
+#include <runtime/shaofs_timing.h>
 
 #include "defs.h"
 
@@ -357,13 +358,14 @@ static __noinline void schedule(void)
 	th = perthread_read_stable(__self);
 
 	/* unmark busy for the stack of the last uthread */
-	if (likely(th != NULL)) {
-		store_release(&th->thread_running, false);
-		th->total_cycles += prog_cycles;
-		store_release(&th->cur_kthread, NCPU);
-		perthread_store(__self, NULL);
-		th = NULL;
-	}
+		if (likely(th != NULL)) {
+			store_release(&th->thread_running, false);
+			th->total_cycles += prog_cycles;
+			shaofs_tbd_sched_thread_run_cycles(th, prog_cycles);
+			store_release(&th->cur_kthread, NCPU);
+			perthread_store(__self, NULL);
+			th = NULL;
+		}
 
 	/* increment the RCU generation number (even is in scheduler) */
 	store_release(&l->rcu_gen, l->rcu_gen + 1);
@@ -439,6 +441,7 @@ again:
 
 	/* keep trying to find work until the polling timeout expires */
 	perthread_get_stable(last_tsc) = rdtsc();
+	shaofs_tbd_sched_poll_iter();
 	if (!preempt_cede_needed(l) &&
 	    (++iters < RUNTIME_SCHED_POLL_ITERS ||
 	     perthread_get_stable(last_tsc) - start_tsc < cycles_per_us * RUNTIME_SCHED_MIN_POLL_US ||
@@ -452,8 +455,11 @@ again:
 
 	/* did not find anything to run, park this kthread */
 	STAT(SCHED_CYCLES) += perthread_get_stable(last_tsc) - start_tsc;
+	shaofs_tbd_sched_cycles(perthread_get_stable(last_tsc) - start_tsc);
 	/* we may have got a preempt signal before voluntarily yielding */
+	uint64_t park_start_tsc = rdtsc();
 	kthread_park();
+	shaofs_tbd_sched_kthread_park(rdtsc() - park_start_tsc);
 	start_tsc = rdtsc();
 	iters = 0;
 
@@ -479,6 +485,7 @@ done:
 	/* update exit stat counters */
 	perthread_get_stable(last_tsc) = rdtsc();
 	STAT(SCHED_CYCLES) += perthread_get_stable(last_tsc) - start_tsc;
+	shaofs_tbd_sched_cycles(perthread_get_stable(last_tsc) - start_tsc);
 	if (cores_have_affinity(th->last_cpu, l->curr_cpu))
 		STAT(LOCAL_RUNS)++;
 	else
@@ -526,6 +533,7 @@ static __always_inline void enter_schedule(thread_t *curth)
 	prog_cycles = now_tsc - perthread_get_stable(last_tsc);
 	STAT(PROGRAM_CYCLES) += prog_cycles;
 	curth->total_cycles += prog_cycles;
+	shaofs_tbd_sched_thread_run_cycles(curth, prog_cycles);
 	perthread_get_stable(last_tsc) = now_tsc;
 
 	/* pop the next runnable thread from the queue */

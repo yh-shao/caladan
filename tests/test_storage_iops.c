@@ -32,7 +32,7 @@ static void work_handler(void *arg)
 	tid = atomic_fetch_and_add(&thread_counter, 1);
 
 	for (i = 0; i < N; i++)
-		BUG_ON(storage_write(p, 8 * (tid * N + i), 8));
+		BUG_ON(storage_write(p, tid * N + i, 1));
 
 	waitgroup_done(wg_parent);
 }
@@ -46,7 +46,7 @@ static void main_handler(void *arg)
 
 	log_info("started main_handler() thread");
 
-	BUG_ON(8 * (N + 1) * WORKERS > storage_num_blocks());
+	BUG_ON((N + 1) * WORKERS > storage_num_blocks());
 
 	waitgroup_init(&wg);
 	waitgroup_add(&wg, WORKERS);
